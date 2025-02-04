@@ -1,0 +1,43 @@
+{
+  "name": "fnn_cell_profiling",
+  "comment": "Baseline fully connected feed forward network with pre-calculated features",
+  "workspace": "/SSL_data/supervisedCNNs/Bray_bioactives/supervised_outputs/cellpainting_1",
+  "dataset": {
+    "reader": "dataset_cell_profiler.CellpaintingPrecalculated_complete",
+    "train": {      
+      "sample_index_file": "/SSL_data/supervisedCNNs/Bray_bioactives/processed_data/data_split_1/all_labels_train1.npy",
+      "data_file": "/SSL_data/supervisedCNNs/Bray_bioactives/processed_data/data_split_1/impute_features_train1.npy"
+    },
+    "val": {      
+      "sample_index_file": "/SSL_data/supervisedCNNs/Bray_bioactives/processed_data/data_split_1/all_labels_val1.npy",
+      "data_file": "/SSL_data/supervisedCNNs/Bray_bioactives/processed_data/data_split_1/impute_features_val1.npy"   
+    }
+  },
+  "optimizer": "import::torch.optim.SGD",
+  "optimizer_params": {
+    "lr": 1e-2,
+    "momentum": 0.9,
+    "weight_decay": 1e-4
+  },
+  "clip_grad_norm": {
+    "max_norm": 5,
+    "norm_type": 2
+  },
+  "lr_schedule_disabled": {
+    "decay_epoch": 20,
+    "decay_rate": 0.1
+  },
+  "model": "models.KlammbauerNetRelu",
+  "model_params": {
+    "fc_units": 2048,
+    "dropout": 0.5
+  },
+  "training": {
+    "epochs": 100,
+    "batchsize": 256
+  },
+  "evaluation": {
+    "validation_step": null,
+    "class_statistics": true
+  }
+}

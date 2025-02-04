@@ -1,0 +1,39 @@
+{
+  "name": "fnn_dinotest",
+  "comment": "Baseline fully connected feed forward network with pre-calculated features",
+  "workspace": "/SSL_data/supervisedCNNs/Bray_bioactives/supervised_outputs/dino_split3_test",
+  "dataset": {
+    "reader": "dataset_cell_profiler.CellpaintingPrecalculated_complete",
+    "test": {      
+      "sample_index_file": "/SSL_data/supervisedCNNs/Bray_bioactives/processed_data/dino/data_split_3/all_labels_test3.npy",
+      "data_file": "/SSL_data/supervisedCNNs/Bray_bioactives/processed_data/dino/data_split_3/features_test3.npy"   
+    }
+  },
+  "optimizer": "import::torch.optim.SGD",
+  "optimizer_params": {
+    "lr": 1e-2,
+    "momentum": 0.9,
+    "weight_decay": 1e-4
+  },
+  "clip_grad_norm": {
+    "max_norm": 5,
+    "norm_type": 2
+  },
+  "lr_schedule_disabled": {
+    "decay_epoch": 20,
+    "decay_rate": 0.1
+  },
+  "model": "models.KlammbauerNetRelu",
+  "model_params": {
+    "fc_units": 2048,
+    "dropout": 0.5
+  },
+  "training": {
+    "epochs": 100,
+    "batchsize": 128
+  },
+  "evaluation": {
+    "validation_step": null,
+    "class_statistics": true
+  }
+}
