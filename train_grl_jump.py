@@ -7,7 +7,9 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import Sampler
+import wandb
 
 import source.augment as au
 from source import SimCLR, get_jump_dataloaders
@@ -327,6 +329,21 @@ class SimCLRWithGRL(SimCLR):
                 print(f"  📊 Domain distribution: {domain_counts.cpu().numpy()}")
                 print(f"  📊 Domain accuracy: {acc:.3f}, AUC: {auc_value}")
 
+                # Log detailed metrics to wandb
+                if hasattr(self.logger, "experiment") and hasattr(
+                    self.logger.experiment, "log"
+                ):
+                    # Log domain distribution as histogram
+                    domain_dist = domain_counts.cpu().numpy()
+                    for i, count in enumerate(domain_dist):
+                        self.log(f"{mode}_domain_{i}_count", count, prog_bar=False)
+
+                    # Log domain balance metric (entropy of distribution)
+                    if count > 0:
+                        probs = domain_dist / domain_dist.sum()
+                        entropy = -np.sum(probs * np.log(probs + 1e-8))
+                        self.log(f"{mode}_domain_entropy", entropy, prog_bar=False)
+
         return loss
 
     def _update_grl_lambda(self, batch_idx):
@@ -383,11 +400,15 @@ class SimCLRWithGRL(SimCLR):
         total_loss = simclr_loss + domain_loss
         self.log("train_total_loss", total_loss, prog_bar=True)
 
+        # Log GRL lambda for tracking
+        self.log("train_grl_lambda", self.adv_lambda, prog_bar=False)
+
         # Log detailed progress every 10 batches
         if batch_idx % 10 == 0:
             print(
                 f"    [LOSSES] SimCLR: {simclr_loss:.4f}, Domain: {domain_loss:.4f}, Total: {total_loss:.4f}"
             )
+            print(f"    [GRL] Lambda: {self.adv_lambda:.3f}")
 
         return total_loss
 
@@ -407,6 +428,36 @@ class SimCLRWithGRL(SimCLR):
         )
         domain_targets = torch.cat([domain_targets, domain_targets], dim=0)
         _ = self._domain_loss_and_metrics(penultimate, domain_targets, mode="val")
+
+    def on_train_epoch_end(self):
+        """Called at the end of each training epoch"""
+        print(f"✅ Epoch {self.current_epoch} training completed")
+        print(f"  - Final GRL lambda: {self.adv_lambda:.3f}")
+
+        # Log epoch-level metrics to wandb
+        if hasattr(self.logger, "experiment") and hasattr(
+            self.logger.experiment, "log"
+        ):
+            # Log current learning rate
+            current_lr = self.optimizers().param_groups[0]["lr"]
+            self.log("train_learning_rate", current_lr, prog_bar=False)
+
+            # Log epoch summary
+            self.log("train_epoch", self.current_epoch, prog_bar=False)
+
+        print()
+
+    def on_validation_epoch_end(self):
+        """Called at the end of each validation epoch"""
+        print(f"✅ Epoch {self.current_epoch} validation completed")
+
+        # Log validation epoch metrics to wandb
+        if hasattr(self.logger, "experiment") and hasattr(
+            self.logger.experiment, "log"
+        ):
+            self.log("val_epoch", self.current_epoch, prog_bar=False)
+
+        print()
 
 
 def main():
@@ -498,6 +549,37 @@ def main():
         "--balanced_batches",
         action="store_true",
         help="Use balanced batch sampling to ensure domain diversity",
+    )
+    # Wandb logging arguments
+    parser.add_argument(
+        "--use_wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="cellpaint-ssl-grl",
+        help="Wandb project name",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Wandb entity/username (optional)",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Custom run name for wandb (optional)",
+    )
+    parser.add_argument(
+        "--wandb_tags",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Tags for wandb run",
     )
 
     args = parser.parse_args()
@@ -613,6 +695,53 @@ def main():
     print(f"  - Val batches: {len(val_loader)}")
     print()
 
+    # Setup wandb logging
+    loggers = []
+    if args.use_wandb:
+        print("📊 SETTING UP WANDB LOGGING...")
+
+        # Create run name if not provided
+        if args.wandb_run_name is None:
+            run_name = f"grl_jump_adv{adv_lambda}_bs{batch_size}_lr{lr}"
+            if balanced_batches:
+                run_name += "_balanced"
+            args.wandb_run_name = run_name
+
+        # Setup wandb logger
+        wandb_logger = WandbLogger(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            tags=args.wandb_tags,
+            log_model=True,  # Log model checkpoints
+        )
+
+        # Log hyperparameters
+        wandb_logger.log_hyperparams(
+            {
+                "arch": args.arch,
+                "batch_size": batch_size,
+                "max_epochs": max_epochs,
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "hidden_dim": hidden_dim,
+                "temperature": temperature,
+                "adv_lambda": adv_lambda,
+                "domain_hidden": domain_hidden,
+                "freeze_encoder": freeze_encoder,
+                "balanced_batches": balanced_batches,
+                "num_workers": num_workers,
+                "train_ratio": train_ratio,
+                "num_domains": num_domains,
+            }
+        )
+
+        loggers.append(wandb_logger)
+        print(f"  - Project: {args.wandb_project}")
+        print(f"  - Run name: {args.wandb_run_name}")
+        print(f"  - Tags: {args.wandb_tags}")
+        print()
+
     # Trainer
     print("🏃 SETTING UP TRAINER...")
     trainer = pl.Trainer(
@@ -632,6 +761,7 @@ def main():
             LearningRateMonitor("epoch"),
         ],
         gradient_clip_val=3.0,
+        logger=loggers,  # Add wandb logger
     )
     trainer.logger._default_hp_metric = None
     print(f"  - Checkpoint dir: {os.path.join(ckpt_path, 'GRL_Jump_SimCLR')}")
