@@ -684,7 +684,7 @@ def main():
             batch_sampler=balanced_sampler,  # Use batch_sampler instead of sampler
             num_workers=num_workers,
             pin_memory=True,
-            drop_last=True,  # Drop incomplete batches for consistent batch sizes
+            # Note: batch_sampler handles drop_last internally by only yielding complete batches
         )
         print("  - Balanced batch sampling enabled")
 
