@@ -627,6 +627,9 @@ def main():
     print("🔧 SETTING UP ENVIRONMENT...")
     pl.seed_everything(args.seed)
     os.makedirs(ckpt_path, exist_ok=True)
+    print(f"  - Checkpoint base directory: {ckpt_path}")
+    print(f"  - Directory exists: {os.path.exists(ckpt_path)}")
+    print(f"  - Directory writable: {os.access(ckpt_path, os.W_OK)}")
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     device = (
@@ -756,6 +759,8 @@ def main():
                 save_top_k=-1,
                 monitor=None,
                 every_n_epochs=every_n_epochs,
+                save_last=True,  # Always save the last checkpoint
+                filename="epoch_{epoch:02d}",
             ),
             LearningRateMonitor("epoch"),
         ],
@@ -861,6 +866,19 @@ def main():
     print("=" * 80)
     print("🎉 TRAINING COMPLETED!")
     print("=" * 80)
+
+    # Check if checkpoints were saved
+    checkpoint_dir = os.path.join(ckpt_path, "GRL_Jump_SimCLR")
+    if os.path.exists(checkpoint_dir):
+        checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith(".ckpt")]
+        print(f"📁 Checkpoints saved: {len(checkpoints)}")
+        for ckpt in checkpoints:
+            print(f"  - {ckpt}")
+    else:
+        print(f"❌ Checkpoint directory not found: {checkpoint_dir}")
+        print(
+            "  - This might indicate a permission issue or the directory wasn't created"
+        )
 
 
 if __name__ == "__main__":
