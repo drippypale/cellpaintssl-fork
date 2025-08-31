@@ -755,12 +755,14 @@ def main():
         log_every_n_steps=5,  # Log every 10 steps instead of default 50
         callbacks=[
             ModelCheckpoint(
+                dirpath=os.path.join(ckpt_path, "GRL_Jump_SimCLR"),
                 save_weights_only=True,
-                save_top_k=-1,
-                monitor=None,
-                every_n_epochs=every_n_epochs,
+                save_top_k=3,  # Save top 3 checkpoints
+                monitor="train_total_loss",
+                mode="min",
+                every_n_epochs=1,  # Save every epoch
                 save_last=True,  # Always save the last checkpoint
-                filename="epoch_{epoch:02d}",
+                filename="epoch_{epoch:02d}-{train_total_loss:.4f}",
             ),
             LearningRateMonitor("epoch"),
         ],
@@ -869,16 +871,34 @@ def main():
 
     # Check if checkpoints were saved
     checkpoint_dir = os.path.join(ckpt_path, "GRL_Jump_SimCLR")
+    print(f"🔍 Checking checkpoint directory: {checkpoint_dir}")
+    print(f"  - Directory exists: {os.path.exists(checkpoint_dir)}")
+
     if os.path.exists(checkpoint_dir):
         checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith(".ckpt")]
         print(f"📁 Checkpoints saved: {len(checkpoints)}")
         for ckpt in checkpoints:
-            print(f"  - {ckpt}")
+            ckpt_path_full = os.path.join(checkpoint_dir, ckpt)
+            ckpt_size = (
+                os.path.getsize(ckpt_path_full) if os.path.exists(ckpt_path_full) else 0
+            )
+            print(f"  - {ckpt} ({ckpt_size} bytes)")
+
+        # Also check for any other files in the directory
+        all_files = os.listdir(checkpoint_dir)
+        other_files = [f for f in all_files if not f.endswith(".ckpt")]
+        if other_files:
+            print(f"📄 Other files in checkpoint directory: {other_files}")
     else:
         print(f"❌ Checkpoint directory not found: {checkpoint_dir}")
         print(
             "  - This might indicate a permission issue or the directory wasn't created"
         )
+
+        # Check if the base directory exists
+        print(f"  - Base directory exists: {os.path.exists(ckpt_path)}")
+        if os.path.exists(ckpt_path):
+            print(f"  - Base directory contents: {os.listdir(ckpt_path)}")
 
 
 if __name__ == "__main__":
