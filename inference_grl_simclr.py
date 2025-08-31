@@ -46,18 +46,52 @@ def load_grl_simclr_model(checkpoint_path, arch="vit_small_patch16_224"):
     """
     print(f"Loading GRL-SimCLR checkpoint from: {checkpoint_path}")
 
-    # Load the full GRL-SimCLR model
+    # First, load the checkpoint to get the hyperparameters
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    # Extract hyperparameters from checkpoint
+    if "hyper_parameters" in checkpoint:
+        hparams = checkpoint["hyper_parameters"]
+        num_domains = hparams.get("num_domains", 10)  # Default to 10 if not found
+        adv_lambda = hparams.get("adv_lambda", 1.0)
+        domain_hidden = hparams.get("domain_hidden", 128)
+        freeze_encoder = hparams.get("freeze_encoder", True)
+        max_epochs = hparams.get("max_epochs", 1)
+        lr = hparams.get("lr", 1e-3)
+        hidden_dim = hparams.get("hidden_dim", 128)
+        temperature = hparams.get("temperature", 0.2)
+        weight_decay = hparams.get("weight_decay", 0.1)
+    else:
+        # Fallback values if hyperparameters not found
+        print("⚠️  Hyperparameters not found in checkpoint, using defaults")
+        num_domains = 10  # Default to 10 domains for JUMP
+        adv_lambda = 1.0
+        domain_hidden = 128
+        freeze_encoder = True
+        max_epochs = 1
+        lr = 1e-3
+        hidden_dim = 128
+        temperature = 0.2
+        weight_decay = 0.1
+
+    print(f"  - Extracted hyperparameters:")
+    print(f"    - num_domains: {num_domains}")
+    print(f"    - adv_lambda: {adv_lambda}")
+    print(f"    - domain_hidden: {domain_hidden}")
+    print(f"    - hidden_dim: {hidden_dim}")
+
+    # Load the full GRL-SimCLR model with correct hyperparameters
     model = SimCLRWithGRL.load_from_checkpoint(
         checkpoint_path,
-        num_domains=1,  # Dummy value for loading
-        adv_lambda=1.0,  # Dummy value for loading
-        domain_hidden=128,  # Dummy value for loading
-        freeze_encoder=True,  # Dummy value for loading
-        max_epochs=1,  # Dummy value for loading
-        lr=1e-3,  # Dummy value for loading
-        hidden_dim=128,  # Dummy value for loading
-        temperature=0.2,  # Dummy value for loading
-        weight_decay=0.1,  # Dummy value for loading
+        num_domains=num_domains,
+        adv_lambda=adv_lambda,
+        domain_hidden=domain_hidden,
+        freeze_encoder=freeze_encoder,
+        max_epochs=max_epochs,
+        lr=lr,
+        hidden_dim=hidden_dim,
+        temperature=temperature,
+        weight_decay=weight_decay,
         vit=arch,
     )
 
