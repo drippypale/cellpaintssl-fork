@@ -749,6 +749,7 @@ def main():
         strategy="auto",
         max_epochs=max_epochs,
         num_sanity_val_steps=0,
+        log_every_n_steps=5,  # Log every 10 steps instead of default 50
         callbacks=[
             ModelCheckpoint(
                 save_weights_only=True,
