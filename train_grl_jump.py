@@ -386,9 +386,7 @@ class SimCLRWithGRL(SimCLR):
 
         # Domain targets repeated for both views
         domain_targets = (
-            torch.tensor(domain_labels, device=self.device, dtype=torch.long)
-            .detach()
-            .clone()
+            domain_labels.detach().clone().to(device=self.device, dtype=torch.long)
         )
         domain_targets = torch.cat([domain_targets, domain_targets], dim=0)
 
