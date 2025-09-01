@@ -506,8 +506,8 @@ def main():
     parser.add_argument(
         "--hidden_dim",
         type=int,
-        default=128,
-        help="Hidden dimension of contrastive projector output",
+        default=384,
+        help="Hidden dimension of contrastive projector output (384 to match original SimCLR)",
     )
     parser.add_argument("--temperature", type=float, default=0.2, help="Temperature")
     parser.add_argument("--size", type=int, default=224, help="Image size")
