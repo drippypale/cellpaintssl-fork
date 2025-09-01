@@ -200,8 +200,14 @@ class SimCLRWithGRL(SimCLR):
         self.grl = GradientReversal(lambd=self.adv_lambda)
 
         # Infer domain head input dimension from actual projector
-        # Get the penultimate layer output dimension from the MLP
+        # The penultimate features are after the first linear layer + ReLU
+        # So input dimension is 4 * hidden_dim (output of first linear layer)
         in_dim = self.mlp[0].out_features  # First linear layer output dim
+
+        print(f"  🔧 Domain head input dimension: {in_dim}")
+        print(
+            f"  🔧 Expected: 4 * {self.hparams.hidden_dim} = {4 * self.hparams.hidden_dim}"
+        )
 
         self.domain_head = nn.Sequential(
             nn.Linear(in_dim, domain_hidden),
@@ -506,8 +512,8 @@ def main():
     parser.add_argument(
         "--hidden_dim",
         type=int,
-        default=384,
-        help="Hidden dimension of contrastive projector output (384 to match original SimCLR)",
+        default=128,
+        help="Hidden dimension of contrastive projector output (128 to match pretrained checkpoint)",
     )
     parser.add_argument("--temperature", type=float, default=0.2, help="Temperature")
     parser.add_argument("--size", type=int, default=224, help="Image size")
@@ -621,6 +627,7 @@ def main():
     print(f"  - Freeze encoder: {freeze_encoder}")
     print(f"  - Balanced batches: {balanced_batches}")
     print(f"  - Max samples: {max_samples}")
+    print(f"  - Hidden dimension: {hidden_dim}")
     print()
 
     # Seed and determinism
@@ -777,6 +784,7 @@ def main():
 
     # Model
     print("🧠 CREATING MODEL...")
+    print(f"  - Creating SimCLRWithGRL with hidden_dim={hidden_dim}")
     model = SimCLRWithGRL(
         num_domains=num_domains,
         adv_lambda=adv_lambda,
@@ -794,6 +802,12 @@ def main():
     print(f"  - Temperature: {temperature}")
     print(f"  - Domain hidden: {domain_hidden}")
     print(f"  - Freeze encoder: {freeze_encoder}")
+
+    # Debug MLP structure
+    print(f"  - MLP structure:")
+    print(f"    - mlp[0]: {model.mlp[0]} (output dim: {model.mlp[0].out_features})")
+    print(f"    - mlp[1]: {model.mlp[1]}")
+    print(f"    - mlp[2]: {model.mlp[2]} (output dim: {model.mlp[2].out_features})")
     print()
 
     # Sanity check: Test GRL gradient reversal
@@ -840,6 +854,27 @@ def main():
     print(
         f"  - State dict keys: {list(state_dict.keys())[:10]}..."
     )  # Show first 10 keys
+
+    # Debug: Show MLP-related keys in checkpoint
+    mlp_keys = [k for k in state_dict.keys() if "mlp" in k]
+    print(f"  - MLP keys in checkpoint: {mlp_keys}")
+
+    # Debug: Show expected vs actual MLP dimensions
+    print(f"  - Expected MLP dimensions (hidden_dim={hidden_dim}):")
+    print(
+        f"    - mlp.0.weight: [4*{hidden_dim}, embed_dim] = [{4 * hidden_dim}, embed_dim]"
+    )
+    print(
+        f"    - mlp.2.weight: [{hidden_dim}, 4*{hidden_dim}] = [{hidden_dim}, {4 * hidden_dim}]"
+    )
+
+    # Show actual dimensions from checkpoint
+    if "mlp.0.weight" in state_dict:
+        actual_dim0 = state_dict["mlp.0.weight"].shape
+        print(f"  - Actual mlp.0.weight: {actual_dim0}")
+    if "mlp.2.weight" in state_dict:
+        actual_dim2 = state_dict["mlp.2.weight"].shape
+        print(f"  - Actual mlp.2.weight: {actual_dim2}")
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     # Optional: print/load info for debugging
