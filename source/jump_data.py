@@ -30,6 +30,8 @@ class JumpDataset(Dataset):
         self,
         submission_csv: str,
         images_base_path: str = "/content/drive/MyDrive/jump_data/images",
+        compound_platemap: str = "/content/drive/MyDrive/jump_data/metadata/JUMP-Target-1_compound_platemap.tsv",
+        compound_metadata: str = "/content/drive/MyDrive/jump_data/metadata/JUMP-Target-1_compound_metadata.tsv",
         max_samples: Optional[int] = None,
         filter_conditions: Optional[Dict] = None,
     ):
@@ -42,6 +44,9 @@ class JumpDataset(Dataset):
         """
         print(f"📊 [JUMP] Initializing dataset from {submission_csv}")
         self.images_base_path = images_base_path
+
+        self.compound_platemap = pd.read_csv(compound_platemap, sep="\t")
+        self.compound_metadata = pd.read_csv(compound_metadata, sep="\t")
 
         # Load submission CSV
         print(f"📋 [JUMP] Loading submission CSV...")
@@ -85,6 +90,18 @@ class JumpDataset(Dataset):
         # Convert to DataFrame for easier filtering
         self.metadata_df = pd.DataFrame(self.metadata_list)
         print(f"  - Total samples loaded: {len(self.metadata_df)}")
+
+        print(f"📊 [JUMP] Merging compound platemap and metadata...")
+        self.metadata_df = self.metadata_df.merge(
+            self.compound_platemap,
+            how="left",
+            left_on="Metadata_Well",
+            right_on="well_position",
+        )
+        self.metadata_df = self.metadata_df.merge(
+            self.compound_metadata, how="left", on="broad_sample"
+        )
+        self.metadata_df["SMILES"] = self.metadata_df["smiles"]
 
         # Apply filters if specified
         if filter_conditions:
@@ -208,9 +225,11 @@ class JumpDataset(Dataset):
                 "plate": plate,
                 "well": well,
                 "site": site,
-                "compound": row.get("Metadata_Name", "") or "",
-                "smiles": row.get("Metadata_SMILES", "") or "",
-                "pert_type": row.get("Metadata_pert_type", "") or "",
+                "compound": row.get("broad_sample", "") or "",
+                "smiles": row.get("smiles", "") or "",
+                "pert_type": row.get("pert_type", "") or "",
+                "pert_iname": row.get("pert_iname", "") or "",
+                "pert_id": row.get("pert_id", "") or "",
             }
 
             return img, metadata_dict
@@ -477,6 +496,8 @@ class JumpSubsetWithTransformAndDomainLabels(Dataset):
 def get_jump_dataloaders(
     submission_csv: str,
     images_base_path: str = "/content/drive/MyDrive/jump_data/images",
+    compound_platemap: str = "/content/drive/MyDrive/jump_data/metadata/JUMP-Target-1_compound_platemap.tsv",
+    compound_metadata: str = "/content/drive/MyDrive/jump_data/metadata/JUMP-Target-1_compound_metadata.tsv",
     transform=None,
     batch_size: int = 32,
     num_workers: int = 4,
@@ -507,6 +528,8 @@ def get_jump_dataloaders(
     print(f"🔧 [DATALOADER] Creating JUMP dataloaders...")
     print(f"  - Submission CSV: {submission_csv}")
     print(f"  - Images base path: {images_base_path}")
+    print(f"  - Compound platemap: {compound_platemap}")
+    print(f"  - Compound metadata: {compound_metadata}")
     print(f"  - Batch size: {batch_size}")
     print(f"  - Num workers: {num_workers}")
     print(f"  - Train ratio: {train_ratio}")
@@ -518,6 +541,8 @@ def get_jump_dataloaders(
     dataset = JumpDataset(
         submission_csv=submission_csv,
         images_base_path=images_base_path,
+        compound_platemap=compound_platemap,
+        compound_metadata=compound_metadata,
         max_samples=max_samples,
         filter_conditions=filter_conditions,
     )
