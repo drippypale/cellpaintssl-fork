@@ -220,6 +220,7 @@ class SimCLRWithGRL(SimCLR):
         self.domain_head = nn.Sequential(
             nn.Linear(adapter_in_dim, domain_hidden),
             nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
             nn.Linear(domain_hidden, self.num_domains),
         )
 
