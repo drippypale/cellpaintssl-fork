@@ -188,6 +188,8 @@ class SimCLRWithGRL(SimCLR):
         adv_lambda: float = 1.0,
         domain_hidden: int = 128,
         freeze_encoder: bool = True,
+        adapter_hidden: int = 384,
+        adapter_scale: float = 0.1,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -198,9 +200,16 @@ class SimCLRWithGRL(SimCLR):
         # Initialize GRL with the user-specified lambda
         self.grl = GradientReversal(lambd=self.adv_lambda)
 
-        # Infer domain head input dimension from actual projector
-        # The penultimate features are after the first linear layer + ReLU
-        # So input dimension is 4 * hidden_dim (output of first linear layer)
+        # Residual adapter after backbone (trainable even if encoder is frozen)
+        embed_dim = self.mlp[0].in_features  # backbone output dimension
+        self.adapter = nn.Sequential(
+            nn.Linear(embed_dim, adapter_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(adapter_hidden, embed_dim),
+        )
+        self.adapter_scale = float(adapter_scale)
+
+        # Domain head on projector penultimate features (Linear->ReLU output)
         in_dim = self.mlp[0].out_features  # First linear layer output dim
 
         print(f"  🔧 Domain head input dimension: {in_dim}")
@@ -217,9 +226,14 @@ class SimCLRWithGRL(SimCLR):
         if self.freeze_encoder:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+        # Ensure adapter and domain head are trainable
+        for p in self.adapter.parameters():
+            p.requires_grad = True
+        for p in self.domain_head.parameters():
+            p.requires_grad = True
 
     def configure_optimizers(self):
-        # Optimize only trainable parameters (projector + domain head; encoder frozen)
+        # Optimize only trainable parameters (adapter + projector + domain head; encoder frozen)
         trainable_params = [p for p in self.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
             trainable_params, lr=self.hparams.lr, weight_decay=self.hparams.weight_decay
@@ -241,8 +255,10 @@ class SimCLRWithGRL(SimCLR):
     def _forward_embeddings(self, imgs):
         # imgs: concatenated tensor of shape [2*B, C, H, W]
         backbone_feats = self.backbone(imgs)
+        # Apply residual adapter
+        adapted = backbone_feats + self.adapter_scale * self.adapter(backbone_feats)
         # Penultimate projector features: Linear -> ReLU
-        penultimate = self.mlp[1](self.mlp[0](backbone_feats))
+        penultimate = self.mlp[1](self.mlp[0](adapted))
         # Final contrastive representation
         feats = self.mlp[2](penultimate)
         return feats, penultimate
@@ -277,6 +293,10 @@ class SimCLRWithGRL(SimCLR):
         # Compute domain accuracy
         with torch.no_grad():
             pred = logits.argmax(dim=-1)
+            print("============ Preds =============")
+            print(pred)
+            print("=========== Targets ============")
+            print(domain_targets)
             acc = (pred == domain_targets).float().mean()
             self.log(mode + "_domain_acc", acc, prog_bar=(mode == "train"))
 
@@ -541,6 +561,19 @@ def main():
         action="store_true",
         help="Do not freeze the encoder backbone",
     )
+    # Adapter params
+    parser.add_argument(
+        "--adapter_hidden",
+        type=int,
+        default=384,
+        help="Hidden units in residual adapter after backbone",
+    )
+    parser.add_argument(
+        "--adapter_scale",
+        type=float,
+        default=0.1,
+        help="Residual scale for adapter output (y = x + scale*f(x))",
+    )
     # Data parameters
     parser.add_argument(
         "--max_samples",
@@ -623,6 +656,8 @@ def main():
     balanced_batches = args.balanced_batches
     warmup_epochs = args.warmup_epochs
     lr_final_value = args.lr_final_value
+    adapter_hidden = args.adapter_hidden
+    adapter_scale = args.adapter_scale
 
     print("📋 CONFIGURATION:")
     print(f"  - Submission CSV: {submission_csv}")
@@ -751,6 +786,8 @@ def main():
                 "num_workers": num_workers,
                 "train_ratio": train_ratio,
                 "num_domains": num_domains,
+                "adapter_hidden": adapter_hidden,
+                "adapter_scale": adapter_scale,
             }
         )
 
@@ -800,6 +837,8 @@ def main():
         adv_lambda=adv_lambda,
         domain_hidden=domain_hidden,
         freeze_encoder=freeze_encoder,
+        adapter_hidden=adapter_hidden,
+        adapter_scale=adapter_scale,
         max_epochs=max_epochs,
         warmup_epochs=warmup_epochs,
         lr_final_value=lr_final_value,
@@ -814,6 +853,7 @@ def main():
     print(f"  - Temperature: {temperature}")
     print(f"  - Domain hidden: {domain_hidden}")
     print(f"  - Freeze encoder: {freeze_encoder}")
+    print(f"  - Adapter: hidden={adapter_hidden}, scale={adapter_scale}")
 
     # Debug MLP structure
     print(f"  - MLP structure:")
