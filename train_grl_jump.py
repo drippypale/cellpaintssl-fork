@@ -10,7 +10,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import Sampler
 import wandb
-
+from source.jump_data import custom_collate_fn
 import source.augment as au
 from source import SimCLR, get_jump_dataloaders
 
@@ -692,6 +692,7 @@ def main():
             batch_sampler=balanced_sampler,  # Use batch_sampler instead of sampler
             num_workers=num_workers,
             pin_memory=True,
+            collate_fn=custom_collate_fn,  # Use custom collate function for metadata
             # Note: batch_sampler handles drop_last internally by only yielding complete batches
         )
         print("  - Balanced batch sampling enabled")

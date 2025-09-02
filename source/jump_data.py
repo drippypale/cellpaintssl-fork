@@ -493,6 +493,62 @@ class JumpSubsetWithTransformAndDomainLabels(Dataset):
                 return [img], metadata, domain_label
 
 
+def custom_collate_fn(batch):
+    """
+    Custom collate function to handle JUMP dataset batches with metadata.
+
+    Args:
+        batch: List of (views, metadata, domain_label) tuples when with_domain_labels=True
+               List of (views, metadata) tuples when with_domain_labels=False
+
+    Returns:
+        Batched views, metadata, and domain labels (if applicable)
+    """
+    # Separate the components
+    views_list = []
+    metadata_list = []
+    domain_labels = []
+
+    # Check if we have domain labels (3 items) or not (2 items)
+    has_domain_labels = len(batch[0]) == 3
+
+    for item in batch:
+        if has_domain_labels:
+            views, metadata, domain_label = item
+            domain_labels.append(domain_label)
+        else:
+            views, metadata = item
+
+        views_list.append(views)
+        metadata_list.append(metadata)
+
+    # Handle views (list of tensors)
+    if isinstance(views_list[0], list):
+        # Multiple views per sample (e.g., SimCLR with 2 views)
+        num_views = len(views_list[0])
+        batched_views = []
+        for view_idx in range(num_views):
+            view_tensors = [views[view_idx] for views in views_list]
+            batched_views.append(torch.stack(view_tensors, dim=0))
+    else:
+        # Single view per sample
+        batched_views = torch.stack(views_list, dim=0)
+
+    # Handle metadata (dict of lists)
+    batched_metadata = {}
+    if metadata_list:
+        for key in metadata_list[0].keys():
+            batched_metadata[key] = [metadata[key] for metadata in metadata_list]
+
+    if has_domain_labels:
+        # Return 3 items: views, metadata, domain_labels
+        batched_domain_labels = torch.tensor(domain_labels, dtype=torch.long)
+        return batched_views, batched_metadata, batched_domain_labels
+    else:
+        # Return 2 items: views, metadata
+        return batched_views, batched_metadata
+
+
 def get_jump_dataloaders(
     submission_csv: str,
     images_base_path: str = "/content/drive/MyDrive/jump_data/images",
@@ -586,6 +642,7 @@ def get_jump_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn=custom_collate_fn,
     )
 
     val_loader = DataLoader(
@@ -595,6 +652,7 @@ def get_jump_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
+        collate_fn=custom_collate_fn,
     )
 
     print(f"✅ [DATALOADER] Dataloaders ready!")
