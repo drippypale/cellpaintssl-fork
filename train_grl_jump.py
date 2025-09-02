@@ -9,7 +9,6 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import Sampler
-import wandb
 from source.jump_data import custom_collate_fn
 import source.augment as au
 from source import SimCLR, get_jump_dataloaders
@@ -445,6 +444,7 @@ class SimCLRWithGRL(SimCLR):
             # Log current learning rate
             current_lr = self.optimizers().param_groups[0]["lr"]
             self.log("train_learning_rate", current_lr, prog_bar=False)
+            print(f"  - Current LR: {current_lr:.6e}")
 
             # Log epoch summary
             self.log("train_epoch", self.current_epoch, prog_bar=False)
@@ -504,6 +504,11 @@ def main():
     )
     parser.add_argument(
         "--every_n_epochs", type=int, default=1, help="Save checkpoint every n epochs"
+    )
+    # LR scheduler parameters
+    parser.add_argument("--warmup_epochs", type=int, default=1, help="LR warmup epochs")
+    parser.add_argument(
+        "--lr_final_value", type=float, default=1e-6, help="Cosine final LR"
     )
     # Adam parameters
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
@@ -616,6 +621,8 @@ def main():
     max_samples = args.max_samples
     train_ratio = args.train_ratio
     balanced_batches = args.balanced_batches
+    warmup_epochs = args.warmup_epochs
+    lr_final_value = args.lr_final_value
 
     print("📋 CONFIGURATION:")
     print(f"  - Submission CSV: {submission_csv}")
@@ -732,6 +739,8 @@ def main():
                 "batch_size": batch_size,
                 "max_epochs": max_epochs,
                 "lr": lr,
+                "warmup_epochs": warmup_epochs,
+                "lr_final_value": lr_final_value,
                 "weight_decay": weight_decay,
                 "hidden_dim": hidden_dim,
                 "temperature": temperature,
@@ -768,7 +777,7 @@ def main():
                 save_top_k=3,  # Save top 3 checkpoints
                 monitor="train_total_loss",
                 mode="min",
-                every_n_epochs=1,  # Save every epoch
+                every_n_epochs=every_n_epochs,  # Save every n epochs from args
                 save_last=True,  # Always save the last checkpoint
                 filename="epoch_{epoch:02d}-{train_total_loss:.4f}",
             ),
@@ -792,6 +801,8 @@ def main():
         domain_hidden=domain_hidden,
         freeze_encoder=freeze_encoder,
         max_epochs=max_epochs,
+        warmup_epochs=warmup_epochs,
+        lr_final_value=lr_final_value,
         lr=lr,
         hidden_dim=hidden_dim,
         temperature=temperature,
