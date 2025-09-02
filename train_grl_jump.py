@@ -293,10 +293,6 @@ class SimCLRWithGRL(SimCLR):
         # Compute domain accuracy
         with torch.no_grad():
             pred = logits.argmax(dim=-1)
-            print("============ Preds =============")
-            print(pred)
-            print("=========== Targets ============")
-            print(domain_targets)
             acc = (pred == domain_targets).float().mean()
             self.log(mode + "_domain_acc", acc, prog_bar=(mode == "train"))
 
