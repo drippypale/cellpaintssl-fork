@@ -209,16 +209,14 @@ class SimCLRWithGRL(SimCLR):
         )
         self.adapter_scale = float(adapter_scale)
 
-        # Domain head on projector penultimate features (Linear->ReLU output)
-        in_dim = self.mlp[0].out_features  # First linear layer output dim
+        # Domain head now takes the adapter output (backbone+adapter) as input
+        adapter_in_dim = embed_dim
 
-        print(f"  🔧 Domain head input dimension: {in_dim}")
-        print(
-            f"  🔧 Expected: 4 * {self.hparams.hidden_dim} = {4 * self.hparams.hidden_dim}"
-        )
+        print(f"  🔧 Domain head input dimension: {adapter_in_dim}")
+        print(f"  🔧 Adapter targets backbone dim (embed_dim): {embed_dim}")
 
         self.domain_head = nn.Sequential(
-            nn.Linear(in_dim, domain_hidden),
+            nn.Linear(adapter_in_dim, domain_hidden),
             nn.ReLU(inplace=True),
             nn.Linear(domain_hidden, self.num_domains),
         )
@@ -261,7 +259,7 @@ class SimCLRWithGRL(SimCLR):
         penultimate = self.mlp[1](self.mlp[0](adapted))
         # Final contrastive representation
         feats = self.mlp[2](penultimate)
-        return feats, penultimate
+        return feats, penultimate, adapted
 
     def _simclr_loss_and_metrics(self, feats, mode: str):
         cos_sim = F.cosine_similarity(feats[:, None, :], feats[None, :, :], dim=-1)
@@ -284,9 +282,9 @@ class SimCLRWithGRL(SimCLR):
         self.log(mode + "_acc_mean_pos", 1 + sim_argsort.float().mean())
         return nll
 
-    def _domain_loss_and_metrics(self, penultimate, domain_targets, mode: str):
-        # Apply GRL before the domain head
-        rev = self.grl(penultimate)
+    def _domain_loss_and_metrics(self, features_for_domain, domain_targets, mode: str):
+        # Apply GRL before the domain head on the adapter output
+        rev = self.grl(features_for_domain)
         logits = self.domain_head(rev)
         loss = F.cross_entropy(logits, domain_targets)
 
@@ -347,8 +345,8 @@ class SimCLRWithGRL(SimCLR):
                 domain_counts = torch.bincount(
                     domain_targets, minlength=self.num_domains
                 )
-                # print(f"  📊 Domain distribution: {domain_counts.cpu().numpy()}")
-                # print(f"  📊 Domain accuracy: {acc:.3f}, AUC: {auc_value}")
+                print(f"  📊 Domain distribution: {domain_counts.cpu().numpy()}")
+                print(f"  📊 Domain accuracy: {acc:.3f}, AUC: {auc_value}")
 
                 # Log detailed metrics to wandb
                 if hasattr(self.logger, "experiment") and hasattr(
@@ -400,7 +398,7 @@ class SimCLRWithGRL(SimCLR):
         # imgs is a list of two views; concatenate across batch dimension
         imgs = torch.cat(imgs, dim=0)
 
-        feats, penultimate = self._forward_embeddings(imgs)
+        feats, penultimate, adapted = self._forward_embeddings(imgs)
 
         # SimCLR loss and metrics
         simclr_loss = self._simclr_loss_and_metrics(feats, mode="train")
@@ -411,8 +409,9 @@ class SimCLRWithGRL(SimCLR):
         )
         domain_targets = torch.cat([domain_targets, domain_targets], dim=0)
 
+        # Domain loss on adapter output (export layer)
         domain_loss = self._domain_loss_and_metrics(
-            penultimate, domain_targets, mode="train"
+            adapted, domain_targets, mode="train"
         )
 
         # Combine losses without additional weighting (lambda is in GRL)
@@ -438,7 +437,7 @@ class SimCLRWithGRL(SimCLR):
 
         imgs, _, domain_labels = batch
         imgs = torch.cat(imgs, dim=0)
-        feats, penultimate = self._forward_embeddings(imgs)
+        feats, penultimate, adapted = self._forward_embeddings(imgs)
         _ = self._simclr_loss_and_metrics(feats, mode="val")
         domain_targets = (
             torch.tensor(domain_labels, device=self.device, dtype=torch.long)
@@ -446,7 +445,7 @@ class SimCLRWithGRL(SimCLR):
             .clone()
         )
         domain_targets = torch.cat([domain_targets, domain_targets], dim=0)
-        _ = self._domain_loss_and_metrics(penultimate, domain_targets, mode="val")
+        _ = self._domain_loss_and_metrics(adapted, domain_targets, mode="val")
 
     def on_train_epoch_end(self):
         """Called at the end of each training epoch"""
