@@ -237,7 +237,15 @@ class SimCLRWithGRL(SimCLR):
             trainable_params, lr=self.hparams.lr, weight_decay=self.hparams.weight_decay
         )
         lr_scheduler = self._get_lr_scheduler(optimizer)
-        return [optimizer], [lr_scheduler]
+        # Step LR every training step to ensure warmup works within first epoch
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": lr_scheduler,
+                "interval": "step",
+                "name": "lr-AdamW",
+            },
+        }
 
     def _get_lr_scheduler(self, optimizer):
         from source import warmup_scheduler
