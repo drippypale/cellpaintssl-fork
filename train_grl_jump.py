@@ -186,6 +186,7 @@ class SimCLRWithGRL(SimCLR):
         self,
         num_domains: int,
         adv_lambda: float = 1.0,
+        domain_loss_weight: float = 1.0,
         domain_hidden: int = 128,
         freeze_encoder: bool = True,
         adapter_hidden: int = 384,
@@ -195,6 +196,7 @@ class SimCLRWithGRL(SimCLR):
         super().__init__(**kwargs)
         self.num_domains = int(num_domains)
         self.adv_lambda = float(adv_lambda)
+        self.domain_loss_weight = domain_loss_weight
         self.freeze_encoder = bool(freeze_encoder)
 
         # Initialize GRL with the user-specified lambda
@@ -423,7 +425,7 @@ class SimCLRWithGRL(SimCLR):
         )
 
         # Combine losses without additional weighting (lambda is in GRL)
-        total_loss = simclr_loss + domain_loss
+        total_loss = simclr_loss + self.domain_loss_weight * domain_loss
         self.log("train_total_loss", total_loss, prog_bar=True)
 
         # Log GRL lambda for tracking
@@ -626,6 +628,12 @@ def main():
         default=[],
         help="Tags for wandb run",
     )
+    parser.add_argument(
+        "--domain_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight of the CE loss of the domain loss in the total loss",
+    )
 
     args = parser.parse_args()
 
@@ -661,6 +669,7 @@ def main():
     lr_final_value = args.lr_final_value
     adapter_hidden = args.adapter_hidden
     adapter_scale = args.adapter_scale
+    domain_loss_weight = args.domain_loss_weight
 
     print("📋 CONFIGURATION:")
     print(f"  - Submission CSV: {submission_csv}")
@@ -783,6 +792,7 @@ def main():
                 "hidden_dim": hidden_dim,
                 "temperature": temperature,
                 "adv_lambda": adv_lambda,
+                "domain_loss_wight": domain_loss_weight,
                 "domain_hidden": domain_hidden,
                 "freeze_encoder": freeze_encoder,
                 "balanced_batches": balanced_batches,
