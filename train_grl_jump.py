@@ -347,8 +347,8 @@ class SimCLRWithGRL(SimCLR):
                 domain_counts = torch.bincount(
                     domain_targets, minlength=self.num_domains
                 )
-                print(f"  📊 Domain distribution: {domain_counts.cpu().numpy()}")
-                print(f"  📊 Domain accuracy: {acc:.3f}, AUC: {auc_value}")
+                # print(f"  📊 Domain distribution: {domain_counts.cpu().numpy()}")
+                # print(f"  📊 Domain accuracy: {acc:.3f}, AUC: {auc_value}")
 
                 # Log detailed metrics to wandb
                 if hasattr(self.logger, "experiment") and hasattr(
