@@ -19,7 +19,8 @@ from tqdm import tqdm
 from source import SimCLR
 from source.models import EmbeddingNet
 from source.jump_data import get_jump_dataloaders
-from source.inference_utils import post_proc  # not used but kept for parity if extended
+
+# from source.inference_utils import post_proc  # kept for parity if extended
 from source.mae.load_mae import load_pretrained_mae
 from source.dino.utils import load_pretrained_dino
 import source.dino.vision_transformer as vits
@@ -31,7 +32,22 @@ def build_embedder(model_name: str, arch: str, ckpt: str):
         vit_arch = (
             "vit_small_patch16_224" if "small" in arch else "vit_base_patch16_224"
         )
-        ssl_model = SimCLR.load_from_checkpoint(ckpt, vit=vit_arch)
+        try:
+            ssl_model = SimCLR.load_from_checkpoint(
+                ckpt, map_location="cpu", vit=vit_arch
+            )
+        except Exception as e:
+            # Fallback: manual CPU load of state_dict
+            print(
+                f"Warning: Lightning load failed ({e}). Falling back to manual load on CPU."
+            )
+            ckpt_obj = torch.load(ckpt, map_location="cpu")
+            state_dict = ckpt_obj.get("state_dict", ckpt_obj)
+            ssl_model = SimCLR(vit=vit_arch)
+            missing, unexpected = ssl_model.load_state_dict(state_dict, strict=False)
+            print(
+                f"  - Manual load: missing={len(missing)} unexpected={len(unexpected)}"
+            )
         return EmbeddingNet(ssl_model)
     elif model_name == "mae":
         return load_pretrained_mae(arch, ckpt)
