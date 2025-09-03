@@ -234,10 +234,41 @@ class SimCLRWithGRL(SimCLR):
             p.requires_grad = True
 
     def configure_optimizers(self):
-        # Optimize only trainable parameters (adapter + projector + domain head; encoder frozen)
-        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        # Parameter groups with different learning rates
+        adapter_params = [
+            p
+            for n, p in self.named_parameters()
+            if n.startswith("adapter.") and p.requires_grad
+        ]
+        head_params = [
+            p
+            for n, p in self.named_parameters()
+            if n.startswith("domain_head.") and p.requires_grad
+        ]
+        projector_params = [
+            p
+            for n, p in self.named_parameters()
+            if n.startswith("mlp.") and p.requires_grad
+        ]
+
         optimizer = torch.optim.AdamW(
-            trainable_params, lr=self.hparams.lr, weight_decay=self.hparams.weight_decay
+            [
+                {
+                    "params": adapter_params,
+                    "lr": self.hparams.lr,
+                    "weight_decay": self.hparams.weight_decay,
+                },  # 1e-3
+                {
+                    "params": head_params,
+                    "lr": 3e-4,
+                    "weight_decay": self.hparams.weight_decay,
+                },  # 3e-4
+                {
+                    "params": projector_params,
+                    "lr": 1e-4,
+                    "weight_decay": self.hparams.weight_decay,
+                },  # 1e-4
+            ]
         )
         lr_scheduler = self._get_lr_scheduler(optimizer)
         # Step LR every training step to ensure warmup works within first epoch
