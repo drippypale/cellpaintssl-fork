@@ -260,7 +260,7 @@ class SimCLRWithGRL(SimCLR):
                 },  # 1e-3
                 {
                     "params": head_params,
-                    "lr": 3e-4,
+                    "lr": 1e-4,
                     "weight_decay": self.hparams.weight_decay,
                 },  # 3e-4
                 {
