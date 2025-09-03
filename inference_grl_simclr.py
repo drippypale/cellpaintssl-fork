@@ -9,16 +9,14 @@ import argparse
 import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 import warnings
-
-warnings.filterwarnings("ignore")
 
 # Import our custom modules
 from source.jump_data import get_jump_dataloaders
 from train_grl_jump import SimCLRWithGRL
-from source import utils
+
+warnings.filterwarnings("ignore")
 
 
 class GRLSimCLREmbeddingNet(torch.nn.Module):
@@ -30,14 +28,18 @@ class GRLSimCLREmbeddingNet(torch.nn.Module):
     def __init__(self, grl_model):
         super().__init__()
         self.backbone = grl_model.backbone
-        self.mlp = grl_model.mlp
+        # Adapter-related modules from GRL model (may not exist on old ckpts)
+        self.adapter = getattr(grl_model, "adapter", None)
+        self.adapter_scale = float(getattr(grl_model, "adapter_scale", 0.0))
+        self.mlp = getattr(grl_model, "mlp", None)
 
     def forward(self, x):
-        # Extract backbone features
+        # Extract backbone features and apply residual adapter if available
         backbone_feats = self.backbone(x)
-        # Project to final embeddings (same as SimCLR)
-        embeddings = self.mlp(backbone_feats)
-        return embeddings
+        if self.adapter is not None and self.adapter_scale != 0.0:
+            adapted = backbone_feats + self.adapter_scale * self.adapter(backbone_feats)
+            return adapted
+        return backbone_feats
 
 
 def load_grl_simclr_model(checkpoint_path, arch="vit_small_patch16_224"):
@@ -49,51 +51,42 @@ def load_grl_simclr_model(checkpoint_path, arch="vit_small_patch16_224"):
     # First, load the checkpoint to get the hyperparameters
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
-    # Extract hyperparameters from checkpoint
-    if "hyper_parameters" in checkpoint:
-        hparams = checkpoint["hyper_parameters"]
-        num_domains = hparams.get("num_domains", 10)  # Default to 10 if not found
-        adv_lambda = hparams.get("adv_lambda", 1.0)
-        domain_hidden = hparams.get("domain_hidden", 128)
-        freeze_encoder = hparams.get("freeze_encoder", True)
-        max_epochs = hparams.get("max_epochs", 1)
-        lr = hparams.get("lr", 1e-3)
-        hidden_dim = hparams.get("hidden_dim", 128)
-        temperature = hparams.get("temperature", 0.2)
-        weight_decay = hparams.get("weight_decay", 0.1)
-    else:
-        # Fallback values if hyperparameters not found
-        print("⚠️  Hyperparameters not found in checkpoint, using defaults")
-        num_domains = 10  # Default to 10 domains for JUMP
-        adv_lambda = 1.0
-        domain_hidden = 128
-        freeze_encoder = True
-        max_epochs = 1
-        lr = 1e-3
-        hidden_dim = 128
-        temperature = 0.2
-        weight_decay = 0.1
-
-    print(f"  - Extracted hyperparameters:")
-    print(f"    - num_domains: {num_domains}")
-    print(f"    - adv_lambda: {adv_lambda}")
-    print(f"    - domain_hidden: {domain_hidden}")
-    print(f"    - hidden_dim: {hidden_dim}")
-
-    # Load the full GRL-SimCLR model with correct hyperparameters
-    model = SimCLRWithGRL.load_from_checkpoint(
-        checkpoint_path,
-        num_domains=num_domains,
-        adv_lambda=adv_lambda,
-        domain_hidden=domain_hidden,
-        freeze_encoder=freeze_encoder,
-        max_epochs=max_epochs,
-        lr=lr,
-        hidden_dim=hidden_dim,
-        temperature=temperature,
-        weight_decay=weight_decay,
-        vit=arch,
-    )
+    # Prefer Lightning to restore the full model and its saved hyperparameters
+    try:
+        model = SimCLRWithGRL.load_from_checkpoint(checkpoint_path, strict=False)
+        print("  - Restored model and hyperparameters from checkpoint")
+    except Exception as e:
+        print(
+            f"⚠️  Direct restore failed ({e}). Falling back to manual init from hparams..."
+        )
+        # Extract minimal hyperparameters for a best-effort load
+        if "hyper_parameters" in checkpoint:
+            hparams = checkpoint["hyper_parameters"]
+            model = SimCLRWithGRL(
+                num_domains=hparams.get("num_domains", 2),
+                adv_lambda=hparams.get("adv_lambda", 1.0),
+                domain_hidden=hparams.get("domain_hidden", 128),
+                freeze_encoder=hparams.get("freeze_encoder", True),
+                adapter_hidden=hparams.get("adapter_hidden", 384),
+                adapter_scale=hparams.get("adapter_scale", 0.1),
+                max_epochs=hparams.get("max_epochs", 1),
+                warmup_epochs=hparams.get("warmup_epochs", 1),
+                lr_final_value=hparams.get("lr_final_value", 1e-6),
+                lr=hparams.get("lr", 1e-3),
+                hidden_dim=hparams.get("hidden_dim", 128),
+                temperature=hparams.get("temperature", 0.2),
+                weight_decay=hparams.get("weight_decay", 0.1),
+                vit=hparams.get("vit", arch),
+                domain_loss_weight=hparams.get("domain_loss_weight", 1.0),
+            )
+            missing, unexpected = model.load_state_dict(
+                checkpoint.get("state_dict", checkpoint), strict=False
+            )
+            print(
+                f"  - Manual state load: missing={len(missing)} unexpected={len(unexpected)}"
+            )
+        else:
+            raise RuntimeError("Checkpoint does not contain required hyperparameters.")
 
     # Create embedding extractor (backbone + projector only)
     embedding_net = GRLSimCLREmbeddingNet(model)
@@ -101,12 +94,17 @@ def load_grl_simclr_model(checkpoint_path, arch="vit_small_patch16_224"):
 
     print("✅ GRL-SimCLR model loaded successfully")
     print(f"  - Backbone: {model.backbone.__class__.__name__}")
-    print(f"  - Projector output dim: {model.mlp[-1].out_features}")
+    try:
+        print(f"  - Projector output dim: {model.mlp[-1].out_features}")
+    except Exception:
+        pass
 
     return embedding_net
 
 
-def extract_embeddings(model, dataloader, device, operation="mean"):
+def extract_embeddings(
+    model, dataloader, device, operation="mean", means=None, stds=None
+):
     """
     Extract embeddings from a dataloader and aggregate them.
     """
@@ -117,6 +115,16 @@ def extract_embeddings(model, dataloader, device, operation="mean"):
     all_metadata = []
 
     print(f"Extracting embeddings with operation: {operation}")
+    # Default normalization: match training in train_grl_jump.py
+    do_norm = True
+    if means is None and stds is None:
+        means = [0.13849893, 0.18710597, 0.1586524, 0.15757588, 0.08674719]
+        stds = [0.13005716, 0.15461144, 0.15929441, 0.16021383, 0.16686504]
+    elif means == [] or stds == []:
+        do_norm = False
+    if do_norm:
+        means_t = torch.tensor(means, device=device).view(1, -1, 1, 1)
+        stds_t = torch.tensor(stds, device=device).view(1, -1, 1, 1)
 
     with torch.no_grad():
         for batch_idx, (views, metadata, _) in enumerate(
@@ -129,6 +137,9 @@ def extract_embeddings(model, dataloader, device, operation="mean"):
                 images = views
 
             images = images.to(device)
+            # Normalize per channel
+            if do_norm:
+                images = (images - means_t) / stds_t
 
             # Extract embeddings
             embeddings = model(images)  # Shape: [batch_size, embedding_dim]
@@ -287,6 +298,11 @@ def main():
         "--arch", type=str, default="vit_small_patch16_224", help="Model architecture"
     )
     parser.add_argument("--gpu", type=int, default=0, help="GPU device ID")
+    parser.add_argument(
+        "--no_normalize",
+        action="store_true",
+        help="Disable input normalization (defaults to enabled)",
+    )
 
     args = parser.parse_args()
 
@@ -330,7 +346,12 @@ def main():
     # Extract embeddings
     print("Extracting embeddings...")
     embeddings, metadata = extract_embeddings(
-        model, train_loader, device, args.operation
+        model,
+        train_loader,
+        device,
+        args.operation,
+        None if not args.no_normalize else [],
+        None if not args.no_normalize else [],
     )
 
     # Aggregate to well level
