@@ -15,6 +15,7 @@ import warnings
 # Import our custom modules
 from source.jump_data import get_jump_dataloaders
 from train_grl_jump import SimCLRWithGRL
+from source import augment as au
 
 warnings.filterwarnings("ignore")
 
@@ -103,7 +104,13 @@ def load_grl_simclr_model(checkpoint_path, arch="vit_small_patch16_224"):
 
 
 def extract_embeddings(
-    model, dataloader, device, operation="mean", means=None, stds=None
+    model,
+    dataloader,
+    device,
+    operation="mean",
+    means=None,
+    stds=None,
+    crop_size: int = 224,
 ):
     """
     Extract embeddings from a dataloader and aggregate them.
@@ -126,6 +133,9 @@ def extract_embeddings(
         means_t = torch.tensor(means, device=device).view(1, -1, 1, 1)
         stds_t = torch.tensor(stds, device=device).view(1, -1, 1, 1)
 
+    # Prepare cell-aware cropper (mandatory)
+    cropper = au.RandomCropWithCells(size=crop_size)
+
     with torch.no_grad():
         for batch_idx, (views, metadata, _) in enumerate(
             tqdm(dataloader, desc="Extracting embeddings")
@@ -136,16 +146,25 @@ def extract_embeddings(
             else:
                 images = views
 
-            images = images.to(device)
+            # Create one cell-aware crop per image (C, crop_size, crop_size)
+            B = images.shape[0]
+            crops = []
+            for b in range(B):
+                img_b = images[b].detach().cpu()
+                crop_b = cropper(img_b, thresh=None)
+                crops.append(crop_b)
+            crops = torch.stack(crops, dim=0)  # [B, C, crop_size, crop_size]
+            crops = crops.to(device)
+
             # Normalize per channel
             if do_norm:
-                images = (images - means_t) / stds_t
+                crops = (crops - means_t) / stds_t
 
             # Extract embeddings
-            embeddings = model(images)  # Shape: [batch_size, embedding_dim]
+            emb = model(crops)  # [B, D]
 
             # Convert to numpy
-            embeddings_np = embeddings.cpu().numpy()
+            embeddings_np = emb.cpu().numpy()
 
             # Store embeddings and metadata
             for i in range(len(embeddings_np)):
@@ -303,6 +322,9 @@ def main():
         action="store_true",
         help="Disable input normalization (defaults to enabled)",
     )
+    parser.add_argument(
+        "--size", type=int, default=224, help="Crop size for RandomCropWithCells"
+    )
 
     args = parser.parse_args()
 
@@ -352,6 +374,7 @@ def main():
         args.operation,
         None if not args.no_normalize else [],
         None if not args.no_normalize else [],
+        crop_size=args.size,
     )
 
     # Aggregate to well level
