@@ -55,6 +55,23 @@ class JumpDataset(Dataset):
             how="left",
             on="broad_sample",
         )
+
+        # Normalize broad_sample to its core ID (e.g., BRD-A86665761-001-01-1 -> BRD-A86665761)
+        def _normalize_broad_sample(x: str) -> str:
+            try:
+                parts = str(x).split("-")
+                if len(parts) >= 2 and parts[0] == "BRD":
+                    return parts[0] + "-" + parts[1]
+
+                if str(x).lower() == "nan":
+                    return "DMSO"
+                return str(x)
+            except Exception:
+                return str(x)
+
+        self.compound_metadata["broad_sample_base"] = self.compound_metadata[
+            "broad_sample"
+        ].apply(_normalize_broad_sample)
         print(f" Compound Target Merged ...")
         print(self.compound_metadata.columns)
 
@@ -111,6 +128,11 @@ class JumpDataset(Dataset):
         self.metadata_df = self.metadata_df.merge(
             self.compound_metadata, how="left", on="broad_sample"
         )
+        # Ensure the normalized base ID exists after merge
+        if "broad_sample_base" not in self.metadata_df.columns:
+            self.metadata_df["broad_sample_base"] = self.metadata_df[
+                "broad_sample"
+            ].apply(_normalize_broad_sample)
         self.metadata_df["SMILES"] = self.metadata_df["smiles"]
 
         # Apply filters if specified
@@ -235,7 +257,10 @@ class JumpDataset(Dataset):
                 "plate": plate,
                 "well": well,
                 "site": site,
-                "compound": row.get("broad_sample", "") or "",
+                # Use normalized compound ID for perturbation_id
+                "compound": row.get("broad_sample_base", "")
+                or row.get("broad_sample", "")
+                or "",
                 "target": row.get("target", "") or "",
                 "smiles": row.get("smiles", "") or "",
                 "pert_type": row.get("pert_type", "") or "",
