@@ -257,17 +257,17 @@ class SimCLRWithGRL(SimCLR):
                     "params": adapter_params,
                     "lr": self.hparams.lr,
                     "weight_decay": self.hparams.weight_decay,
-                },  # 1e-3
+                },
                 {
                     "params": head_params,
-                    "lr": 1e-4,
+                    "lr": 1e-3,
                     "weight_decay": self.hparams.weight_decay,
-                },  # 3e-4
+                },
                 {
                     "params": projector_params,
                     "lr": 1e-4,
                     "weight_decay": self.hparams.weight_decay,
-                },  # 1e-4
+                },
             ]
         )
         lr_scheduler = self._get_lr_scheduler(optimizer)
@@ -461,14 +461,14 @@ class SimCLRWithGRL(SimCLR):
         self.log("train_total_loss", total_loss, prog_bar=True)
 
         # Log GRL lambda for tracking
-        self.log("train_grl_lambda", self.adv_lambda, prog_bar=False)
+        self.log("train_grl_lambda", self.grl.lambd, prog_bar=False)
 
         # Log detailed progress every 10 batches
         if batch_idx % 10 == 0:
             print(
                 f"    [LOSSES] SimCLR: {simclr_loss:.4f}, Domain: {domain_loss:.4f}, Total: {total_loss:.4f}"
             )
-            print(f"    [GRL] Lambda: {self.adv_lambda:.3f}")
+            print(f"    [GRL] Current Lambda: {self.grl.lambd:.3f}")
 
         return total_loss
 
