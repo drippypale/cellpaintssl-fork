@@ -685,6 +685,8 @@ def get_jump_dataloaders(
         pin_memory=True,
         drop_last=True,
         collate_fn=custom_collate_fn,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     val_loader = DataLoader(
@@ -695,6 +697,8 @@ def get_jump_dataloaders(
         pin_memory=True,
         drop_last=False,
         collate_fn=custom_collate_fn,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     print(f"✅ [DATALOADER] Dataloaders ready!")
