@@ -19,8 +19,7 @@ from tqdm import tqdm
 from source import SimCLR
 from source.models import EmbeddingNet
 from source.jump_data import get_jump_dataloaders
-
-# from source.inference_utils import post_proc  # kept for parity if extended
+from source.inference_utils import post_proc
 from source.mae.load_mae import load_pretrained_mae
 from source.dino.utils import load_pretrained_dino
 import source.dino.vision_transformer as vits
@@ -222,6 +221,22 @@ def main():
     parser.add_argument("--size", type=int, default=224)
     parser.add_argument("--no_normalize", action="store_true")
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument(
+        "--norm_method",
+        type=str,
+        default="spherize",
+        choices=[
+            "standardize",
+            "mad_robustize",
+            "spherize",
+            "spherize_mad_robustize",
+            "mad_robustize_spherize",
+            "spherize_standardize",
+            "standardize_spherize",
+            "no_post_proc",
+        ],
+    )
+    parser.add_argument("--l2norm", action="store_true")
 
     args = parser.parse_args()
 
@@ -255,10 +270,31 @@ def main():
     print("Aggregating to well level...")
     well_embs, well_meta = aggregate_to_well(embs, meta, args.operation)
 
+    # Save raw well features
     out_csv = os.path.join(args.output_dir, "well_features.csv")
-    print(f"Saving to {out_csv}")
+    print(f"Saving raw to {out_csv}")
     df = save_well_features(well_embs, well_meta, out_csv)
     print(f"✅ Saved {len(df)} wells with embedding dim {len(well_embs[0])}")
+
+    # Post-process and save normalized well and aggregate features
+    print(f"Postprocessing embeddings method: {args.norm_method}")
+    embeddings_proc_well, embeddings_proc_agg = post_proc(
+        df,
+        df,
+        operation=args.operation,
+        norm_method=args.norm_method,
+        l2_norm=args.l2norm,
+    )
+    norm_outdir = (
+        os.path.join(args.output_dir, args.norm_method)
+        if args.norm_method != "no_post_proc"
+        else args.output_dir
+    )
+    os.makedirs(norm_outdir, exist_ok=True)
+    csv_path_well = os.path.join(norm_outdir, "well_features.csv")
+    csv_path_agg = os.path.join(norm_outdir, "agg_features.csv")
+    embeddings_proc_well.to_csv(csv_path_well, index=False)
+    embeddings_proc_agg.to_csv(csv_path_agg, index=False)
 
 
 if __name__ == "__main__":

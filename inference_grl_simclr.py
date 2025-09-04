@@ -15,6 +15,7 @@ import warnings
 # Import our custom modules
 from source.jump_data import get_jump_dataloaders
 from train_grl_jump import SimCLRWithGRL
+from source.inference_utils import post_proc
 from source import augment as au
 
 warnings.filterwarnings("ignore")
@@ -331,6 +332,27 @@ def main():
     parser.add_argument(
         "--size", type=int, default=224, help="Crop size for RandomCropWithCells"
     )
+    parser.add_argument(
+        "--norm_method",
+        type=str,
+        default="spherize",
+        choices=[
+            "standardize",
+            "mad_robustize",
+            "spherize",
+            "spherize_mad_robustize",
+            "mad_robustize_spherize",
+            "spherize_standardize",
+            "standardize_spherize",
+            "no_post_proc",
+        ],
+        help="Post-processing normalization method applied to embeddings",
+    )
+    parser.add_argument(
+        "--l2norm",
+        action="store_true",
+        help="Apply L2 normalization to features before post-processing",
+    )
 
     args = parser.parse_args()
 
@@ -389,16 +411,39 @@ def main():
         embeddings, metadata, args.operation
     )
 
-    # Create well_features.csv
-    output_path = os.path.join(args.output_dir, "well_features.csv")
+    # Create raw well_features.csv
+    raw_output_path = os.path.join(args.output_dir, "well_features.csv")
     well_features_df = create_well_features_csv(
-        well_embeddings, well_metadata, output_path
+        well_embeddings, well_metadata, raw_output_path
     )
+
+    # Optional post-processing (sphering etc.), and save normalized outputs
+    print(f"Postprocessing embeddings method: {args.norm_method}")
+    embeddings_proc_well, embeddings_proc_agg = post_proc(
+        well_features_df,
+        well_features_df,
+        operation=args.operation,
+        norm_method=args.norm_method,
+        l2_norm=args.l2norm,
+    )
+
+    norm_outdir = (
+        os.path.join(args.output_dir, args.norm_method)
+        if args.norm_method != "no_post_proc"
+        else args.output_dir
+    )
+    os.makedirs(norm_outdir, exist_ok=True)
+    csv_path_well = os.path.join(norm_outdir, "well_features.csv")
+    csv_path_agg = os.path.join(norm_outdir, "agg_features.csv")
+    embeddings_proc_well.to_csv(csv_path_well, index=False)
+    embeddings_proc_agg.to_csv(csv_path_agg, index=False)
 
     print("=" * 80)
     print("✅ INFERENCE COMPLETED!")
     print("=" * 80)
-    print(f"Output saved to: {output_path}")
+    print(f"Raw well features: {raw_output_path}")
+    print(f"Normalized well features: {csv_path_well}")
+    print(f"Normalized agg features: {csv_path_agg}")
     print(f"Total wells: {len(well_features_df)}")
     print(f"Embedding dimension: {len(well_embeddings[0])}")
     print()
