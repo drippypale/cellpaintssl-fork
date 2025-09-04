@@ -69,8 +69,6 @@ class JumpDataset(Dataset):
         total_jobs = len(self.submission_df)
 
         for idx, (_, row) in enumerate(self.submission_df.iterrows()):
-            if idx == 20:
-                break
             if idx % 10 == 0:  # Progress every 10 jobs
                 print(f"  - Processing job {idx + 1}/{total_jobs}: {row['batch']}")
 
