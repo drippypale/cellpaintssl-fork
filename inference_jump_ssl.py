@@ -123,6 +123,9 @@ def extract_embeddings(embedder, dataloader, device, resize_to=224, normalize=Tr
                         "compound": metadata.get("compound", [""])[i]
                         if isinstance(metadata.get("compound", None), list)
                         else metadata.get("compound", ""),
+                        "target": metadata.get("target", [""])[i]
+                        if isinstance(metadata.get("target", None), list)
+                        else metadata.get("target", ""),
                         "smiles": metadata.get("smiles", [""])[i]
                         if isinstance(metadata.get("smiles", None), list)
                         else metadata.get("smiles", ""),
@@ -160,6 +163,9 @@ def aggregate_to_well(embeddings, metadata, operation="mean"):
                 "compound": group.get("compound", pd.Series([""])).iloc[0]
                 if "compound" in group
                 else "",
+                "target": group.get("target", pd.Series([""])).iloc[0]
+                if "target" in group
+                else "",
                 "smiles": group.get("smiles", pd.Series([""])).iloc[0]
                 if "smiles" in group
                 else "",
@@ -183,9 +189,11 @@ def save_well_features(well_embeddings, well_metadata, out_csv):
     df["perturbation_id"] = df.get(
         "compound", pd.Series(["DMSO"]).repeat(len(df))
     ).fillna("DMSO")
-    df["target"] = df.get("compound", pd.Series(["DMSO"]).repeat(len(df))).fillna(
-        "DMSO"
-    )
+    # Use target if present; otherwise fallback to compound
+    if "target" not in df.columns:
+        df["target"] = df.get("compound", pd.Series(["DMSO"]).repeat(len(df))).fillna(
+            "DMSO"
+        )
 
     keep_cols = ["batch", "plate", "well", "perturbation_id", "target"] + emb_cols
     df = df[keep_cols]

@@ -32,6 +32,7 @@ class JumpDataset(Dataset):
         images_base_path: str = "/content/drive/MyDrive/jump_data/images",
         compound_platemap: str = "/content/drive/MyDrive/jump_data/metadata/JUMP-Target-1_compound_platemap.tsv",
         compound_metadata: str = "/content/drive/MyDrive/jump_data/metadata/JUMP-Target-1_compound_metadata.tsv",
+        compound_target: str = "/content/drive/MyDrive/jump_data/metadata/JUMP-Target-1_compound_metadata_targets.tsv",
         max_samples: Optional[int] = None,
         filter_conditions: Optional[Dict] = None,
     ):
@@ -47,6 +48,15 @@ class JumpDataset(Dataset):
 
         self.compound_platemap = pd.read_csv(compound_platemap, sep="\t")
         self.compound_metadata = pd.read_csv(compound_metadata, sep="\t")
+        compound_target_df = pd.read_csv(compound_target, sep="\t")
+
+        self.compound_metadata = self.compound_metadata.merge(
+            compound_target_df[["broad_sample", "target"]],
+            how="left",
+            on="broad_sample",
+        )
+        print(f" Compound Target Merged ...")
+        print(self.compound_metadata.columns)
 
         # Load submission CSV
         print(f"📋 [JUMP] Loading submission CSV...")
@@ -59,6 +69,8 @@ class JumpDataset(Dataset):
         total_jobs = len(self.submission_df)
 
         for idx, (_, row) in enumerate(self.submission_df.iterrows()):
+            if idx == 20:
+                break
             if idx % 10 == 0:  # Progress every 10 jobs
                 print(f"  - Processing job {idx + 1}/{total_jobs}: {row['batch']}")
 
@@ -226,6 +238,7 @@ class JumpDataset(Dataset):
                 "well": well,
                 "site": site,
                 "compound": row.get("broad_sample", "") or "",
+                "target": row.get("target", "") or "",
                 "smiles": row.get("smiles", "") or "",
                 "pert_type": row.get("pert_type", "") or "",
                 "pert_iname": row.get("pert_iname", "") or "",
@@ -245,6 +258,7 @@ class JumpDataset(Dataset):
                 "well": "unknown",
                 "site": "unknown",
                 "compound": "",
+                "target": "",
                 "smiles": "",
                 "pert_type": "",
             }
@@ -307,6 +321,7 @@ class JumpSubsetWithDomainLabels(Dataset):
                 "well": "unknown",
                 "site": "unknown",
                 "compound": "",
+                "target": "",
                 "smiles": "",
                 "pert_type": "",
             }
@@ -478,6 +493,7 @@ class JumpSubsetWithTransformAndDomainLabels(Dataset):
                 "well": "unknown",
                 "site": "unknown",
                 "compound": "",
+                "target": "",
                 "smiles": "",
                 "pert_type": "",
             }
@@ -554,6 +570,7 @@ def get_jump_dataloaders(
     images_base_path: str = "/content/drive/MyDrive/jump_data/images",
     compound_platemap: str = "/content/drive/MyDrive/jump_data/metadata/JUMP-Target-1_compound_platemap.tsv",
     compound_metadata: str = "/content/drive/MyDrive/jump_data/metadata/JUMP-Target-1_compound_metadata.tsv",
+    compound_target: str = "/content/drive/MyDrive/jump_data/metadata/JUMP-Target-1_compound_metadata_targets.tsv",
     transform=None,
     batch_size: int = 32,
     num_workers: int = 4,
@@ -586,6 +603,7 @@ def get_jump_dataloaders(
     print(f"  - Images base path: {images_base_path}")
     print(f"  - Compound platemap: {compound_platemap}")
     print(f"  - Compound metadata: {compound_metadata}")
+    print(f"  - Compound target: {compound_target}")
     print(f"  - Batch size: {batch_size}")
     print(f"  - Num workers: {num_workers}")
     print(f"  - Train ratio: {train_ratio}")
@@ -599,6 +617,7 @@ def get_jump_dataloaders(
         images_base_path=images_base_path,
         compound_platemap=compound_platemap,
         compound_metadata=compound_metadata,
+        compound_target=compound_target,
         max_samples=max_samples,
         filter_conditions=filter_conditions,
     )

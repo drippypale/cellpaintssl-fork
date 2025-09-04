@@ -177,6 +177,9 @@ def extract_embeddings(
                         "well": metadata["well"][i],
                         "site": metadata["site"][i],
                         "compound": metadata["compound"][i],
+                        "target": metadata.get("target", [""])[i]
+                        if isinstance(metadata.get("target", None), list)
+                        else metadata.get("target", ""),
                         "smiles": metadata["smiles"][i],
                         "pert_type": metadata["pert_type"][i],
                     }
@@ -220,6 +223,9 @@ def aggregate_embeddings_to_well_level(embeddings, metadata, operation="mean"):
                 "well": well,
                 "source": group["source"].iloc[0],
                 "compound": group["compound"].iloc[0],
+                "target": group.get("target", pd.Series([""])).iloc[0]
+                if "target" in group
+                else "",
                 "smiles": group["smiles"].iloc[0],
                 "pert_type": group["pert_type"].iloc[0],
             }
@@ -245,11 +251,11 @@ def create_well_features_csv(well_embeddings, well_metadata, output_path):
     well_features_df = pd.concat([metadata_df, embeddings_df], axis=1)
 
     # Add required columns for evaluation
-    # Note: These might need to be filled based on your actual data
+    # Use true compound and target from JUMP metadata when available
     well_features_df["perturbation_id"] = well_features_df["compound"].fillna("DMSO")
-    well_features_df["target"] = well_features_df["compound"].fillna(
-        "DMSO"
-    )  # You might need to map this properly
+    # Prefer true target column; fallback to compound if missing
+    if "target" not in well_features_df.columns:
+        well_features_df["target"] = well_features_df["compound"].fillna("DMSO")
 
     # Reorder columns to match expected format
     required_cols = [
