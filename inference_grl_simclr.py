@@ -419,9 +419,13 @@ def main():
 
     # Optional post-processing (sphering etc.), and save normalized outputs
     print(f"Postprocessing embeddings method: {args.norm_method}")
+    # Provide just metadata columns to the second argument as expected by post_proc
+    val_df_meta = (
+        well_features_df[["perturbation_id", "target"]].drop_duplicates().copy()
+    )
     embeddings_proc_well, embeddings_proc_agg = post_proc(
-        well_features_df,
-        well_features_df,
+        well_features_df.copy(),
+        val_df_meta,
         operation=args.operation,
         norm_method=args.norm_method,
         l2_norm=args.l2norm,
