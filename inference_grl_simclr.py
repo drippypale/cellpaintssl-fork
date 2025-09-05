@@ -11,11 +11,12 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import warnings
+import pycytominer
 
 # Import our custom modules
 from source.jump_data import get_jump_dataloaders
 from train_grl_jump import SimCLRWithGRL
-from source.inference_utils import post_proc
+from source.inference_utils import postprocess_embeddings
 from source import augment as au
 
 warnings.filterwarnings("ignore")
@@ -419,16 +420,24 @@ def main():
 
     # Optional post-processing (sphering etc.), and save normalized outputs
     print(f"Postprocessing embeddings method: {args.norm_method}")
-    # Provide just metadata columns to the second argument as expected by post_proc
-    val_df_meta = (
-        well_features_df[["perturbation_id", "target"]].drop_duplicates().copy()
-    )
-    embeddings_proc_well, embeddings_proc_agg = post_proc(
+    embeddings_proc_well = postprocess_embeddings(
         well_features_df.copy(),
-        val_df_meta,
-        operation=args.operation,
+        var_thresh=1e-5,
+        trt_column="perturbation_id",
         norm_method=args.norm_method,
         l2_norm=args.l2norm,
+    )
+    emb_features = [c for c in embeddings_proc_well.columns if c.startswith("emb")]
+    embeddings_proc_agg = pycytominer.aggregate(
+        embeddings_proc_well,
+        strata=["perturbation_id"],
+        features=emb_features,
+        operation=args.operation,
+    )
+    embeddings_proc_agg = pd.merge(
+        left=embeddings_proc_agg,
+        right=well_features_df.loc[:, ["perturbation_id", "target"]].drop_duplicates(),
+        how="left",
     )
 
     norm_outdir = (
