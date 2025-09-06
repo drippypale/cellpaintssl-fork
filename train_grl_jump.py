@@ -12,6 +12,9 @@ from torch.utils.data import Sampler
 from source.jump_data import custom_collate_fn
 import source.augment as au
 from source import SimCLR, get_jump_dataloaders
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+import source.eval as evl
 
 
 class BalancedBatchSampler(Sampler):
@@ -193,11 +196,38 @@ class SimCLRWithGRL(SimCLR):
         adapter_scale: float = 0.1,
         **kwargs,
     ):
+        # Pop custom kwargs not recognized by base SimCLR
+        projector_lr = kwargs.pop("projector_lr", 1e-4)
+        head_lr_scale = kwargs.pop("head_lr_scale", 0.5)
+        head_update_every = kwargs.pop("head_update_every", 1)
+        lambda_delay_frac = kwargs.pop("lambda_delay_frac", 0.2)
+        domain_head_dropout = kwargs.pop("domain_head_dropout", 0.1)
+
         super().__init__(**kwargs)
         self.num_domains = int(num_domains)
         self.adv_lambda = float(adv_lambda)
         self.domain_loss_weight = domain_loss_weight
         self.freeze_encoder = bool(freeze_encoder)
+
+        # Attach custom hparams to both self and self.hparams for downstream access
+        self.projector_lr = float(projector_lr)
+        self.head_lr_scale = float(head_lr_scale)
+        self.head_update_every = int(head_update_every)
+        self.lambda_delay_frac = float(lambda_delay_frac)
+        self.domain_head_dropout = float(domain_head_dropout)
+        if hasattr(self, "hparams"):
+            try:
+                self.hparams.projector_lr = self.projector_lr
+                self.hparams.head_lr_scale = self.head_lr_scale
+                self.hparams.head_update_every = self.head_update_every
+                self.hparams.lambda_delay_frac = self.lambda_delay_frac
+                self.hparams.domain_head_dropout = self.domain_head_dropout
+            except Exception:
+                pass
+
+        # Track best leakage trough
+        self.best_batch_auc = float("inf")
+        self.best_nsb_at_auc = 0.0
 
         # Initialize GRL with the user-specified lambda
         self.grl = GradientReversal(lambd=self.adv_lambda)
@@ -213,14 +243,12 @@ class SimCLRWithGRL(SimCLR):
 
         # Domain head now takes the adapter output (backbone+adapter) as input
         adapter_in_dim = embed_dim
-
         print(f"  🔧 Domain head input dimension: {adapter_in_dim}")
         print(f"  🔧 Adapter targets backbone dim (embed_dim): {embed_dim}")
-
         self.domain_head = nn.Sequential(
             nn.Linear(adapter_in_dim, domain_hidden),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
+            nn.Dropout(self.domain_head_dropout),
             nn.Linear(domain_hidden, self.num_domains),
         )
 
@@ -251,21 +279,32 @@ class SimCLRWithGRL(SimCLR):
             if n.startswith("mlp.") and p.requires_grad
         ]
 
+        projector_lr = float(
+            getattr(self.hparams, "projector_lr", getattr(self, "projector_lr", 1e-4))
+        )
+        head_lr_scale = float(
+            getattr(self.hparams, "head_lr_scale", getattr(self, "head_lr_scale", 0.5))
+        )
+        head_lr = projector_lr * head_lr_scale
+
         optimizer = torch.optim.AdamW(
             [
                 {
+                    "name": "adapter",
                     "params": adapter_params,
                     "lr": self.hparams.lr,
                     "weight_decay": self.hparams.weight_decay,
                 },
                 {
+                    "name": "head",
                     "params": head_params,
-                    "lr": 1e-3,
+                    "lr": head_lr,
                     "weight_decay": self.hparams.weight_decay,
                 },
                 {
+                    "name": "projector",
                     "params": projector_params,
-                    "lr": 1e-4,
+                    "lr": projector_lr,
                     "weight_decay": self.hparams.weight_decay,
                 },
             ]
@@ -291,6 +330,37 @@ class SimCLRWithGRL(SimCLR):
             max_epochs=self.hparams.max_epochs,
             eta_min=self.hparams.lr_final_value,
         )
+
+    def on_before_optimizer_step(self, optimizer):
+        """Optionally update head LR every N steps by zeroing it on skipped steps."""
+        try:
+            update_every = int(
+                getattr(
+                    self.hparams,
+                    "head_update_every",
+                    getattr(self, "head_update_every", 1),
+                )
+            )
+            projector_lr = float(
+                getattr(
+                    self.hparams, "projector_lr", getattr(self, "projector_lr", 1e-4)
+                )
+            )
+            head_lr_scale = float(
+                getattr(
+                    self.hparams, "head_lr_scale", getattr(self, "head_lr_scale", 0.5)
+                )
+            )
+            base_head_lr = projector_lr * head_lr_scale
+            for group in optimizer.param_groups:
+                name = group.get("name", "")
+                if name == "head":
+                    if update_every > 1 and (self.global_step % update_every) != 0:
+                        group["lr"] = 0.0
+                    else:
+                        group["lr"] = base_head_lr
+        except Exception:
+            pass
 
     def _forward_embeddings(self, imgs):
         # imgs: concatenated tensor of shape [2*B, C, H, W]
@@ -328,7 +398,7 @@ class SimCLRWithGRL(SimCLR):
         # Apply GRL before the domain head on the adapter output
         rev = self.grl(features_for_domain)
         logits = self.domain_head(rev)
-        loss = F.cross_entropy(logits, domain_targets)
+        loss = F.cross_entropy(logits, domain_targets, label_smoothing=0.1)
 
         # Compute domain accuracy
         with torch.no_grad():
@@ -408,18 +478,26 @@ class SimCLRWithGRL(SimCLR):
         return loss
 
     def _update_grl_lambda(self, batch_idx):
-        """Update GRL lambda using Ganin schedule"""
+        """Update GRL lambda with delayed ramp: 0 for first frac, then Ganin to target."""
         if hasattr(self, "trainer") and self.trainer is not None:
             current_step = (
                 self.current_epoch * self.trainer.num_training_batches + batch_idx
             )
             total_steps = self.hparams.max_epochs * self.trainer.num_training_batches
-            p = current_step / total_steps
-            # Ganin schedule: ramps up from 0 to adv_lambda
-            lam = (2.0 / (1.0 + np.exp(-10 * p)) - 1.0) * self.adv_lambda
+            p = current_step / max(1, total_steps)
+            delay = float(
+                getattr(
+                    self.hparams,
+                    "lambda_delay_frac",
+                    getattr(self, "lambda_delay_frac", 0.2),
+                )
+            )
+            if p < delay:
+                lam = 0.0
+            else:
+                p2 = (p - delay) / max(1e-8, (1.0 - delay))
+                lam = (2.0 / (1.0 + np.exp(-10 * p2)) - 1.0) * self.adv_lambda
             self.grl.lambd = lam
-
-            # Log lambda progress every 10 batches
             if batch_idx % 10 == 0:
                 print(
                     f"  [GRL] Epoch {self.current_epoch}, Batch {batch_idx}/{self.trainer.num_training_batches}, "
@@ -482,12 +560,230 @@ class SimCLRWithGRL(SimCLR):
         feats, penultimate, adapted = self._forward_embeddings(imgs)
         _ = self._simclr_loss_and_metrics(feats, mode="val")
         domain_targets = (
-            torch.tensor(domain_labels, device=self.device, dtype=torch.long)
-            .detach()
-            .clone()
+            domain_labels.detach().clone().to(device=self.device, dtype=torch.long)
         )
         domain_targets = torch.cat([domain_targets, domain_targets], dim=0)
         _ = self._domain_loss_and_metrics(adapted, domain_targets, mode="val")
+
+    def _mini_eval_and_log(self):
+        """Run a lightweight validation-style eval on a few val batches and log metrics."""
+        try:
+            val_dls = getattr(self.trainer, "val_dataloaders", None)
+            if val_dls is None:
+                print("⚠️  No val_dataloaders available for mini-eval")
+                return
+            # Support both a single DataLoader or a list/tuple of loaders
+            if isinstance(val_dls, (list, tuple)):
+                if len(val_dls) == 0:
+                    print("⚠️  Empty val_dataloaders for mini-eval")
+                    return
+                val_loader = val_dls[0]
+            else:
+                val_loader = val_dls
+
+            # Label alignment note
+            print(
+                "🔎 Label alignment: domain_labels source column = 'batch'; batch leakage column = 'batch'"
+            )
+
+            self.eval()
+            device = self.device
+            rows = []
+            max_batches = 10  # sample more batches to improve diversity
+            batches_done = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    try:
+                        imgs, metadata_collated, _domain = batch
+                    except Exception:
+                        try:
+                            imgs, metadata_collated = batch
+                            _domain = None
+                        except Exception:
+                            break
+
+                    view = imgs[0] if isinstance(imgs, (list, tuple)) else imgs
+                    view = view.to(device)
+
+                    backbone_feats = self.backbone(view)
+                    adapted = backbone_feats + self.adapter_scale * self.adapter(
+                        backbone_feats
+                    )
+                    embs = adapted.detach().cpu().numpy()
+
+                    B = embs.shape[0]
+                    # metadata_collated is a dict of lists per custom_collate_fn
+                    for i in range(B):
+                        meta = {}
+                        if isinstance(metadata_collated, dict):
+                            for k in ("batch", "plate", "well", "compound", "target"):
+                                try:
+                                    seq = metadata_collated.get(k, None)
+                                    meta[k] = (
+                                        seq[i]
+                                        if isinstance(seq, list) and len(seq) > i
+                                        else None
+                                    )
+                                except Exception:
+                                    meta[k] = None
+                        elif (
+                            isinstance(metadata_collated, (list, tuple))
+                            and len(metadata_collated) > i
+                        ):
+                            md = metadata_collated[i]
+                            if isinstance(md, dict):
+                                meta = md
+
+                        row = {
+                            "batch": meta.get("batch", None),
+                            "plate": meta.get("plate", None),
+                            "well": meta.get("well", None),
+                            # map compound to perturbation_id for eval compatibility
+                            "perturbation_id": meta.get("compound", None),
+                            "target": meta.get("target", None),
+                        }
+                        for j, v in enumerate(embs[i]):
+                            row[f"emb{j}"] = float(v)
+                        rows.append(row)
+
+                    batches_done += 1
+
+                    # Early stop if we have enough diversity
+                    if batches_done >= max_batches:
+                        break
+                    if len(rows) >= 200:
+                        df_tmp = pd.DataFrame(rows)
+                        if (
+                            df_tmp.get("batch").nunique(dropna=True) >= 2
+                            and df_tmp.get("perturbation_id").nunique(dropna=True) >= 2
+                        ):
+                            break
+
+            if len(rows) < 20:
+                return
+
+            df = pd.DataFrame(rows)
+            feature_cols = [c for c in df.columns if c.startswith("emb")]
+
+            # For alignment visibility, print a small sample
+            try:
+                u_batches = df.get("batch").dropna().astype(str).unique().tolist()[:5]
+                print(f"  ↳ Sample batches (minieval): {u_batches}")
+            except Exception:
+                pass
+
+            # Batch leakage proxies (only if >=2 batch classes)
+            batch_auc_val = None
+            try:
+                if df.get("batch").nunique(dropna=True) >= 2:
+                    batch_metrics = evl.batch_classification(df)
+                    self.log(
+                        "val_batch_MCC", float(batch_metrics.get("MCC", float("nan")))
+                    )
+                    batch_auc_val = float(batch_metrics.get("ROC_AUC", float("nan")))
+                    self.log(
+                        "val_batch_ROC_AUC",
+                        batch_auc_val,
+                    )
+                else:
+                    print(
+                        "⚠️  mini-eval: only one batch class observed; skipping batch ROC_AUC/MCC"
+                    )
+            except Exception as e:
+                print(f"⚠️  batch classification eval failed: {e}")
+
+            # NSB perturbation accuracy
+            nsb_acc_val = None
+            if (
+                "perturbation_id" in df.columns
+                and df["perturbation_id"].notnull().any()
+            ):
+                try:
+                    X = StandardScaler().fit_transform(df[feature_cols].to_numpy())
+                    y = LabelEncoder().fit_transform(
+                        df["perturbation_id"].astype(str).values
+                    )
+                    batches = (
+                        df["batch"].astype(str).values
+                        if "batch" in df.columns
+                        else np.array([""] * len(df))
+                    )
+                    if len(np.unique(batches)) < 2:
+                        print(
+                            "⚠️  mini-eval: only one batch label; NSB may be ill-posed"
+                        )
+                    ypred_nsb = evl.nearest_neighbor_classifier_NSBW(
+                        X, y, mode="NSB", batches=batches, metric="cosine"
+                    )
+                    nsb_acc = (ypred_nsb == y).mean()
+                    nsb_acc_val = float(nsb_acc)
+                    self.log("val_pert_acc_NSB", nsb_acc_val)
+                except Exception as e:
+                    print(f"⚠️  NSB perturbation eval failed: {e}")
+
+            # Perturbation mAP (aggregated)
+            try:
+                # Keep only valid perturbation IDs with at least 2 samples
+                df_valid = df[
+                    df["perturbation_id"].notnull()
+                    & (df["perturbation_id"].astype(str) != "")
+                ].copy()
+                vc = df_valid["perturbation_id"].value_counts()
+                keep_ids = set(vc[vc >= 2].index.tolist())
+                df_valid = df_valid[df_valid["perturbation_id"].isin(keep_ids)].copy()
+                if df_valid["perturbation_id"].nunique() < 2:
+                    print(
+                        "⚠️  mAP eval skipped: not enough perturbations with >=2 samples"
+                    )
+                else:
+                    agg = (
+                        df_valid.groupby(["perturbation_id"])
+                        .mean(numeric_only=True)
+                        .reset_index()
+                    )
+                    # Standardize features for stability
+                    Xagg = StandardScaler().fit_transform(agg[feature_cols].to_numpy())
+                    agg_std = agg.copy()
+                    for j, c in enumerate(feature_cols):
+                        agg_std[c] = Xagg[:, j]
+                    pr_k, pr_dist = evl.calculate_precision_recall(
+                        agg_std, feature_cols, label_col="perturbation_id"
+                    )
+                    if "mAP" in pr_dist.columns:
+                        mAP_val = float(pr_dist["mAP"].iloc[0])
+                        if not np.isnan(mAP_val):
+                            self.log("val_pert_mAP", mAP_val)
+                        else:
+                            print("⚠️  mAP returned NaN; skipping log")
+                    else:
+                        print("⚠️  mAP column not found in precision-recall output")
+            except Exception as e:
+                print(f"⚠️  Perturbation mAP eval failed: {e}")
+
+            # Early-stop checkpointing at leakage trough
+            try:
+                if (
+                    batch_auc_val is not None
+                    and nsb_acc_val is not None
+                    and not np.isnan(batch_auc_val)
+                ):
+                    improved_auc = batch_auc_val < (self.best_batch_auc - 1e-6)
+                    nsb_not_worse = nsb_acc_val >= (self.best_nsb_at_auc - 1e-6)
+                    if improved_auc and nsb_not_worse:
+                        self.best_batch_auc = batch_auc_val
+                        self.best_nsb_at_auc = nsb_acc_val
+                        ckpt_dir = self.trainer.default_root_dir or "."
+                        fname = f"earlystop_epoch{self.current_epoch:02d}_auc{batch_auc_val:.4f}_nsb{nsb_acc_val:.4f}.ckpt"
+                        path = os.path.join(ckpt_dir, fname)
+                        self.trainer.save_checkpoint(path)
+                        print(f"💾 Saved early-stop checkpoint at AUC trough: {path}")
+                        # Log best-so-far values
+                        self.log("val_best_batch_ROC_AUC", self.best_batch_auc)
+                        self.log("val_best_nsb_at_auc", self.best_nsb_at_auc)
+            except Exception as e:
+                print(f"⚠️  Early-stop checkpointing failed: {e}")
+        except Exception as e:
+            print(f"⚠️  Mini-eval logging failed: {e}")
 
     def on_train_epoch_end(self):
         """Called at the end of each training epoch"""
@@ -498,26 +794,26 @@ class SimCLRWithGRL(SimCLR):
         if hasattr(self.logger, "experiment") and hasattr(
             self.logger.experiment, "log"
         ):
-            # Log current learning rate
             current_lr = self.optimizers().param_groups[0]["lr"]
             self.log("train_learning_rate", current_lr, prog_bar=False)
             print(f"  - Current LR: {current_lr:.6e}")
-
-            # Log epoch summary
             self.log("train_epoch", self.current_epoch, prog_bar=False)
 
+        # Always run mini-eval here to guarantee per-epoch logging
+        self._mini_eval_and_log()
         print()
 
     def on_validation_epoch_end(self):
         """Called at the end of each validation epoch"""
         print(f"✅ Epoch {self.current_epoch} validation completed")
 
-        # Log validation epoch metrics to wandb
         if hasattr(self.logger, "experiment") and hasattr(
             self.logger.experiment, "log"
         ):
             self.log("val_epoch", self.current_epoch, prog_bar=False)
 
+        # Also run the same mini-eval here (if/when val loop executes)
+        self._mini_eval_and_log()
         print()
 
 
@@ -591,7 +887,19 @@ def main():
         help="Weight for adversarial domain CE loss",
     )
     parser.add_argument(
+        "--lambda_delay_frac",
+        type=float,
+        default=0.2,
+        help="Fraction of total steps to keep GRL lambda at 0 before ramping",
+    )
+    parser.add_argument(
         "--domain_hidden", type=int, default=128, help="Hidden units in domain head"
+    )
+    parser.add_argument(
+        "--domain_head_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout probability before domain head logits",
     )
     parser.add_argument(
         "--no_freeze_encoder",
@@ -610,6 +918,24 @@ def main():
         type=float,
         default=0.1,
         help="Residual scale for adapter output (y = x + scale*f(x))",
+    )
+    parser.add_argument(
+        "--projector_lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate for the projector (mlp)",
+    )
+    parser.add_argument(
+        "--head_lr_scale",
+        type=float,
+        default=0.5,
+        help="Domain head LR as a scale of projector_lr (e.g., 0.5 means head is 0.5x)",
+    )
+    parser.add_argument(
+        "--head_update_every",
+        type=int,
+        default=2,
+        help="Update the domain head every N steps (set 1 to disable)",
     )
     # Data parameters
     parser.add_argument(
@@ -783,12 +1109,17 @@ def main():
         )
         print("  - Balanced batch sampling enabled")
 
+    # Dataloaders ready... prints are above
     num_domains = len(batch_to_index)
     print(f"  - Number of domains: {num_domains}")
     print(f"  - Domain mapping: {batch_to_index}")
     print(f"  - Train batches: {len(train_loader)}")
     print(f"  - Val batches: {len(val_loader)}")
     print()
+
+    # Explicit label alignment note
+    print("🔎 Domain labels source column: 'batch'")
+    print("🔎 Batch leakage evaluation column: 'batch'")
 
     # Setup wandb logging
     loggers = []
@@ -824,8 +1155,10 @@ def main():
                 "hidden_dim": hidden_dim,
                 "temperature": temperature,
                 "adv_lambda": adv_lambda,
+                "lambda_delay_frac": args.lambda_delay_frac,
                 "domain_loss_wight": domain_loss_weight,
                 "domain_hidden": domain_hidden,
+                "domain_head_dropout": args.domain_head_dropout,
                 "freeze_encoder": freeze_encoder,
                 "balanced_batches": balanced_batches,
                 "num_workers": num_workers,
@@ -833,6 +1166,9 @@ def main():
                 "num_domains": num_domains,
                 "adapter_hidden": adapter_hidden,
                 "adapter_scale": adapter_scale,
+                "projector_lr": args.projector_lr,
+                "head_lr_scale": args.head_lr_scale,
+                "head_update_every": args.head_update_every,
             }
         )
 
@@ -851,6 +1187,7 @@ def main():
         strategy="auto",
         max_epochs=max_epochs,
         num_sanity_val_steps=0,
+        check_val_every_n_epoch=1,
         log_every_n_steps=5,  # Log every 10 steps instead of default 50
         callbacks=[
             ModelCheckpoint(
@@ -892,6 +1229,12 @@ def main():
         temperature=temperature,
         weight_decay=weight_decay,
         vit=args.arch,
+        # pass new hparams through
+        projector_lr=args.projector_lr,
+        head_lr_scale=args.head_lr_scale,
+        head_update_every=args.head_update_every,
+        lambda_delay_frac=args.lambda_delay_frac,
+        domain_head_dropout=args.domain_head_dropout,
     )
     print(f"  - Architecture: {args.arch}")
     print(f"  - Hidden dim: {hidden_dim}")
@@ -995,7 +1338,7 @@ def main():
     )
     print("=" * 80)
 
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     print("=" * 80)
     print("🎉 TRAINING COMPLETED!")
