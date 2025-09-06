@@ -420,6 +420,14 @@ def main():
 
     # Optional post-processing (sphering etc.), and save normalized outputs
     print(f"Postprocessing embeddings method: {args.norm_method}")
+    # DEBUG context
+    print(
+        f"[DEBUG] well_features_df type={type(well_features_df)}, shape={getattr(well_features_df, 'shape', None)}"
+    )
+    print(
+        f"[DEBUG] pycytominer version: {getattr(pycytominer, '__version__', 'unknown')}"
+    )
+    # Run postprocessing with guard
     embeddings_proc_well = postprocess_embeddings(
         well_features_df.copy(),
         var_thresh=1e-5,
@@ -427,7 +435,15 @@ def main():
         norm_method=args.norm_method,
         l2_norm=args.l2norm,
     )
+    if not hasattr(embeddings_proc_well, "columns"):
+        print(
+            f"[DEBUG][WARN] postprocess_embeddings returned type={type(embeddings_proc_well)}; falling back to raw features for normalization step."
+        )
+        print(f"[DEBUG] Value preview: {str(embeddings_proc_well)[:120]}")
+        embeddings_proc_well = well_features_df.copy()
+
     emb_features = [c for c in embeddings_proc_well.columns if c.startswith("emb")]
+    print(f"[DEBUG] num emb features after postproc: {len(emb_features)}")
     embeddings_proc_agg = pycytominer.aggregate(
         embeddings_proc_well,
         strata=["perturbation_id"],
