@@ -612,6 +612,7 @@ def get_jump_dataloaders(
     filter_conditions: Optional[Dict] = None,
     with_domain_labels: bool = False,
     domain_label_key: str = "batch",
+    **kwargs,
 ):
     """
     Create train/val dataloaders for JUMP dataset.
