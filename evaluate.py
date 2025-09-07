@@ -81,6 +81,33 @@ def compute_target_accuracy(df, features, label="target"):
     return NSP_acc, NSBP_acc
 
 
+def compute_topk_accuracy(df, features, label_col, mode="NSB", k=5):
+    X = StandardScaler().fit_transform(df[features].to_numpy())
+    y = LabelEncoder().fit_transform(df[label_col].values)
+    batches = df["batch"].values
+    wells = df["well"].values
+    # Get top-k neighbor labels
+    knn_labels = evl.KNN_labels_NSBW(
+        X, y, k, mode=mode, batches=batches, wells=wells, metric="cosine"
+    )
+    # Hit@k: any of the k neighbors matches the true label
+    hits = (knn_labels == y[:, None]).any(axis=1)
+    return hits.mean()
+
+
+def compute_random_baseline_top1_NSB(df, features, label_col):
+    # Shuffle labels and compute NSB top-1 accuracy
+    X = StandardScaler().fit_transform(df[features].to_numpy())
+    y = LabelEncoder().fit_transform(df[label_col].values)
+    y_shuf = np.random.permutation(y)
+    batches = df["batch"].values
+    wells = df["well"].values
+    ypred = evl.nearest_neighbor_classifier_NSBW(
+        X, y_shuf, mode="NSB", batches=batches, wells=wells, metric="cosine"
+    )
+    return (ypred == y_shuf).mean()
+
+
 def batch_aggregate(df, features):
     batch_prof = (
         df.groupby(["batch", "perturbation_id"])
@@ -112,6 +139,11 @@ def compute_metrics(embed_list, indir, orf=False):
         "pert_acc_NSB",
         f"{target_label}_acc_NSP",
         f"{target_label}_acc_NSBP",
+        "pert_acc_NSB@5",
+        "pert_acc_NSB@10",
+        f"{target_label}_acc_NSBP@5",
+        f"{target_label}_acc_NSBP@10",
+        "pert_acc_NSB_random_baseline",
         "repl_corr",
         "percent_95",
     ]
@@ -132,12 +164,36 @@ def compute_metrics(embed_list, indir, orf=False):
                 print(f"Skipping {embed}: no data")
                 continue
 
-            # NN and NSB perturbation accuracy
+            # Log basic label cardinality
+            print(
+                f"Unique perturbations: {df['perturbation_id'].nunique()}  | Unique targets: {df[target_label].nunique()}"
+            )
+
+            # NN and NSB perturbation accuracy (top-1)
             pert_acc, NSB_pert_acc = compute_perturbation_accuracy(df, features)
 
-            # NSP and NSBP target/gene family accuracy
+            # NSP and NSBP target/gene family accuracy (top-1)
             NSP_target_acc, NSBP_target_acc = compute_target_accuracy(
                 df, features, label=target_label
+            )
+
+            # Top-k retrieval (NSB for pert, NSBP for target)
+            pert_acc_NSB_at5 = compute_topk_accuracy(
+                df, features, label_col="perturbation_id", mode="NSB", k=5
+            )
+            pert_acc_NSB_at10 = compute_topk_accuracy(
+                df, features, label_col="perturbation_id", mode="NSB", k=10
+            )
+            target_acc_NSBP_at5 = compute_topk_accuracy(
+                df, features, label_col=target_label, mode="NSBW", k=5
+            )
+            target_acc_NSBP_at10 = compute_topk_accuracy(
+                df, features, label_col=target_label, mode="NSBW", k=10
+            )
+
+            # Random baseline (top-1 NSB) for perturbation
+            pert_nsb_rand = compute_random_baseline_top1_NSB(
+                df, features, label_col="perturbation_id"
             )
 
             # percent replicating and mean replicate correlation
@@ -179,6 +235,11 @@ def compute_metrics(embed_list, indir, orf=False):
             dict_metrics["pert_acc_NSB"].append(NSB_pert_acc)
             dict_metrics[f"{target_label}_acc_NSP"].append(NSP_target_acc)
             dict_metrics[f"{target_label}_acc_NSBP"].append(NSBP_target_acc)
+            dict_metrics["pert_acc_NSB@5"].append(pert_acc_NSB_at5)
+            dict_metrics["pert_acc_NSB@10"].append(pert_acc_NSB_at10)
+            dict_metrics[f"{target_label}_acc_NSBP@5"].append(target_acc_NSBP_at5)
+            dict_metrics[f"{target_label}_acc_NSBP@10"].append(target_acc_NSBP_at10)
+            dict_metrics["pert_acc_NSB_random_baseline"].append(pert_nsb_rand)
             dict_metrics["repl_corr"].append(np.nanmean(repl_corr))
             dict_metrics["percent_95"].append(percent_95)
 
