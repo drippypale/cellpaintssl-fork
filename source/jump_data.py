@@ -422,11 +422,21 @@ class JumpDatasetWithTransformAndDomainLabels(Dataset):
 class JumpSubsetWithTransformAndDomainLabels(Dataset):
     """
     Wrapper around Subset that applies transform and preserves domain labels.
+    Supports choosing which metadata column to use as the domain label (e.g., 'batch', 'source', 'plate').
     """
 
-    def __init__(self, subset: Subset, batch_to_index: Dict, transform=None):
+    def __init__(
+        self,
+        subset: Subset,
+        label_to_index: Dict,
+        transform=None,
+        domain_label_key: str = "batch",
+    ):
         self.subset = subset
-        self.batch_to_index = batch_to_index
+        # Maintain historical attribute name for compatibility with existing code/prints
+        self.batch_to_index = label_to_index
+        self.label_to_index = label_to_index
+        self.domain_label_key = domain_label_key
         self.transform = transform
         print(f"🔍 [DEBUG] JumpSubsetWithTransformAndDomainLabels initialized:")
         print(f"  - Subset length: {len(self.subset)}")
@@ -454,8 +464,8 @@ class JumpSubsetWithTransformAndDomainLabels(Dataset):
                 try:
                     # Get metadata from original dataset without loading image
                     row = original_dataset.metadata_df.iloc[original_idx]
-                    batch = row["batch"]
-                    domain = self.batch_to_index.get(batch, 0)
+                    label_value = row.get(self.domain_label_key, "unknown")
+                    domain = self.label_to_index.get(label_value, 0)
 
                     if domain not in domain_indices:
                         domain_indices[domain] = []
@@ -484,8 +494,8 @@ class JumpSubsetWithTransformAndDomainLabels(Dataset):
             if img is None:
                 img = torch.zeros((5, 768, 768), dtype=torch.float32)
 
-            batch = metadata.get("batch", "unknown")
-            domain_label = self.batch_to_index.get(batch, 0)
+            label_value = metadata.get(self.domain_label_key, "unknown")
+            domain_label = self.label_to_index.get(label_value, 0)
 
             if self.transform is not None:
                 # Apply transform to create two views
@@ -601,6 +611,7 @@ def get_jump_dataloaders(
     max_samples: Optional[int] = None,
     filter_conditions: Optional[Dict] = None,
     with_domain_labels: bool = False,
+    domain_label_key: str = "batch",
 ):
     """
     Create train/val dataloaders for JUMP dataset.
@@ -632,6 +643,8 @@ def get_jump_dataloaders(
     print(f"  - Train ratio: {train_ratio}")
     print(f"  - Max samples: {max_samples}")
     print(f"  - With domain labels: {with_domain_labels}")
+    if with_domain_labels:
+        print(f"  - Domain label key: {domain_label_key}")
 
     # Create dataset
     print(f"📊 [DATALOADER] Creating dataset...")
@@ -663,11 +676,21 @@ def get_jump_dataloaders(
     print(f"🏷️  [DATALOADER] Setting up domain labels...")
     if with_domain_labels:
         print(f"  - Creating datasets with domain labels for GRL")
+        # Build mapping for chosen label key
+        if domain_label_key not in dataset.metadata_df.columns:
+            raise ValueError(
+                f"Domain label key '{domain_label_key}' not found in dataset metadata columns: {list(dataset.metadata_df.columns)}"
+            )
+        unique_labels = sorted(
+            dataset.metadata_df[domain_label_key].astype(str).unique()
+        )
+        label_to_index = {label: i for i, label in enumerate(unique_labels)}
+
         train_dataset = JumpSubsetWithTransformAndDomainLabels(
-            train_subset, dataset.batch_to_index, transform
+            train_subset, label_to_index, transform, domain_label_key=domain_label_key
         )
         val_dataset = JumpSubsetWithTransformAndDomainLabels(
-            val_subset, dataset.batch_to_index, transform
+            val_subset, label_to_index, transform, domain_label_key=domain_label_key
         )
     else:
         print(f"  - Creating datasets without domain labels")
@@ -704,6 +727,8 @@ def get_jump_dataloaders(
     print(f"✅ [DATALOADER] Dataloaders ready!")
     print(f"  - Train batches: {len(train_loader)}")
     print(f"  - Val batches: {len(val_loader)}")
-    print(f"  - Domain mapping: {dataset.batch_to_index}")
+    # Return the mapping used. For backward compatibility keep the name 'batch_to_index'.
+    mapping = train_dataset.batch_to_index if with_domain_labels else {}
+    print(f"  - Domain mapping: {mapping}")
 
-    return train_loader, val_loader, dataset.batch_to_index
+    return train_loader, val_loader, mapping

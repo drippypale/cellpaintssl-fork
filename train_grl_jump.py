@@ -202,6 +202,7 @@ class SimCLRWithGRL(SimCLR):
         head_update_every = kwargs.pop("head_update_every", 1)
         lambda_delay_frac = kwargs.pop("lambda_delay_frac", 0.2)
         domain_head_dropout = kwargs.pop("domain_head_dropout", 0.1)
+        domain_label_key = kwargs.pop("domain_label_key", "batch")
 
         super().__init__(**kwargs)
         self.num_domains = int(num_domains)
@@ -215,6 +216,7 @@ class SimCLRWithGRL(SimCLR):
         self.head_update_every = int(head_update_every)
         self.lambda_delay_frac = float(lambda_delay_frac)
         self.domain_head_dropout = float(domain_head_dropout)
+        self.domain_label_key = str(domain_label_key)
         if hasattr(self, "hparams"):
             try:
                 self.hparams.projector_lr = self.projector_lr
@@ -222,6 +224,7 @@ class SimCLRWithGRL(SimCLR):
                 self.hparams.head_update_every = self.head_update_every
                 self.hparams.lambda_delay_frac = self.lambda_delay_frac
                 self.hparams.domain_head_dropout = self.domain_head_dropout
+                self.hparams.domain_label_key = self.domain_label_key
             except Exception:
                 pass
 
@@ -582,8 +585,9 @@ class SimCLRWithGRL(SimCLR):
                 val_loader = val_dls
 
             # Label alignment note
+            adv_label = str(getattr(self.hparams, "domain_label_key", "batch"))
             print(
-                "🔎 Label alignment: domain_labels source column = 'batch'; batch leakage column = 'batch'"
+                f"🔎 Label alignment: adversary label='{adv_label}'; leakage logged for ['batch','source','plate'] if present"
             )
 
             self.eval()
@@ -672,25 +676,31 @@ class SimCLRWithGRL(SimCLR):
             except Exception:
                 pass
 
-            # Batch leakage proxies (only if >=2 batch classes)
+            # Leakage proxies for multiple labels using same embeddings
             batch_auc_val = None
-            try:
-                if df.get("batch").nunique(dropna=True) >= 2:
-                    batch_metrics = evl.batch_classification(df)
+            for label_key in ["batch", "source", "plate"]:
+                try:
+                    if label_key not in df.columns:
+                        continue
+                    if df.get(label_key).nunique(dropna=True) < 2:
+                        print(f"⚠️  mini-eval: only one class for {label_key}; skipping")
+                        continue
+                    df_for_label = df.copy()
+                    # Re-map to 'batch' column expected by evl.batch_classification
+                    df_for_label["batch"] = df_for_label[label_key].astype(str)
+                    metrics = evl.batch_classification(df_for_label)
                     self.log(
-                        "val_batch_MCC", float(batch_metrics.get("MCC", float("nan")))
+                        f"val_leak_{label_key}_MCC",
+                        float(metrics.get("MCC", float("nan"))),
                     )
-                    batch_auc_val = float(batch_metrics.get("ROC_AUC", float("nan")))
-                    self.log(
-                        "val_batch_ROC_AUC",
-                        batch_auc_val,
-                    )
-                else:
-                    print(
-                        "⚠️  mini-eval: only one batch class observed; skipping batch ROC_AUC/MCC"
-                    )
-            except Exception as e:
-                print(f"⚠️  batch classification eval failed: {e}")
+                    auc_val = float(metrics.get("ROC_AUC", float("nan")))
+                    self.log(f"val_leak_{label_key}_ROC_AUC", auc_val)
+                    if label_key == str(
+                        getattr(self.hparams, "domain_label_key", "batch")
+                    ):
+                        batch_auc_val = auc_val
+                except Exception as e:
+                    print(f"⚠️  leakage eval failed for {label_key}: {e}")
 
             # NSB perturbation accuracy
             nsb_acc_val = None
@@ -760,7 +770,7 @@ class SimCLRWithGRL(SimCLR):
             except Exception as e:
                 print(f"⚠️  Perturbation mAP eval failed: {e}")
 
-            # Early-stop checkpointing at leakage trough
+            # Early-stop checkpointing at leakage trough (uses adversary label AUC)
             try:
                 if (
                     batch_auc_val is not None
@@ -955,6 +965,13 @@ def main():
         action="store_true",
         help="Use balanced batch sampling to ensure domain diversity",
     )
+    parser.add_argument(
+        "--domain_label",
+        type=str,
+        default="batch",
+        choices=["batch", "source", "plate"],
+        help="Which metadata label to train the adversary on",
+    )
     # Wandb logging arguments
     parser.add_argument(
         "--use_wandb",
@@ -1023,6 +1040,7 @@ def main():
     max_samples = args.max_samples
     train_ratio = args.train_ratio
     balanced_batches = args.balanced_batches
+    domain_label_key = args.domain_label
     warmup_epochs = args.warmup_epochs
     lr_final_value = args.lr_final_value
     adapter_hidden = args.adapter_hidden
@@ -1091,6 +1109,7 @@ def main():
         train_ratio=train_ratio,
         max_samples=max_samples,
         with_domain_labels=True,
+        domain_label_key=domain_label_key,
     )
 
     # Optionally use balanced batch sampling for training
@@ -1118,8 +1137,8 @@ def main():
     print()
 
     # Explicit label alignment note
-    print("🔎 Domain labels source column: 'batch'")
-    print("🔎 Batch leakage evaluation column: 'batch'")
+    print(f"🔎 Adversary domain label column: '{domain_label_key}'")
+    print("🔎 Leakage will be logged for: ['batch','source','plate'] if present")
 
     # Setup wandb logging
     loggers = []
@@ -1161,6 +1180,7 @@ def main():
                 "domain_head_dropout": args.domain_head_dropout,
                 "freeze_encoder": freeze_encoder,
                 "balanced_batches": balanced_batches,
+                "domain_label_key": domain_label_key,
                 "num_workers": num_workers,
                 "train_ratio": train_ratio,
                 "num_domains": num_domains,
@@ -1235,6 +1255,7 @@ def main():
         head_update_every=args.head_update_every,
         lambda_delay_frac=args.lambda_delay_frac,
         domain_head_dropout=args.domain_head_dropout,
+        domain_label_key=domain_label_key,
     )
     print(f"  - Architecture: {args.arch}")
     print(f"  - Hidden dim: {hidden_dim}")
