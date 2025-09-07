@@ -1213,12 +1213,11 @@ def main():
             ModelCheckpoint(
                 dirpath=os.path.join(ckpt_path, "GRL_Jump_SimCLR"),
                 save_weights_only=True,
-                save_top_k=3,  # Save top 3 checkpoints
-                monitor="train_total_loss",
-                mode="min",
+                save_top_k=-1,  # Save all checkpoints
+                monitor=None,
                 every_n_epochs=every_n_epochs,  # Save every n epochs from args
                 save_last=True,  # Always save the last checkpoint
-                filename="epoch_{epoch:02d}-{train_total_loss:.4f}",
+                filename="epoch_{epoch:02d}",
             ),
             LearningRateMonitor("epoch"),
         ],
