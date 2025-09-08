@@ -14,6 +14,7 @@ import seaborn as sn
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler, LabelEncoder
+import math
 
 from source import utils
 import source.eval as evl
@@ -108,6 +109,51 @@ def compute_random_baseline_top1_NSB(df, features, label_col):
     return (ypred == y_shuf).mean()
 
 
+def _logcomb(n, k):
+    return math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
+
+
+def compute_odds_ratio_pvalue(df, features, label_col, metric="cosine", top_percent=5):
+    # Standardize, compute cosine similarity matrix
+    X = StandardScaler().fit_transform(df[features].to_numpy())
+    labels = LabelEncoder().fit_transform(df[label_col].values)
+    dist_mat = evl.pairwise_distances_parallel(X, metric=metric)
+    np.fill_diagonal(dist_mat, np.nan)
+    sim = 1.0 - dist_mat
+
+    # Use upper triangle once
+    n = sim.shape[0]
+    iu, ju = np.triu_indices(n, k=1)
+    sim_vals = sim[iu, ju]
+    thresh = np.nanpercentile(sim_vals, 100 - top_percent)
+    high = sim_vals >= thresh
+    same = labels[iu] == labels[ju]
+
+    a = int(np.nansum(np.logical_and(high, same)))
+    c = int(np.nansum(np.logical_and(high, ~same)))
+    b = int(np.nansum(np.logical_and(~high, same)))
+    d = int(np.nansum(np.logical_and(~high, ~same)))
+
+    # Haldane–Anscombe correction if any zero cell
+    aa, bb, cc, dd = a, b, c, d
+    if min(aa, bb, cc, dd) == 0:
+        aa += 0.5
+        bb += 0.5
+        cc += 0.5
+        dd += 0.5
+    odds_ratio = (aa / bb) / (cc / dd)
+
+    # Hypergeometric single-table p-value per provided formula
+    logp = _logcomb(a + b, a) + _logcomb(c + d, c) - _logcomb(a + b + c + d, a + c)
+    p_value = float(np.exp(logp))
+
+    return (
+        odds_ratio,
+        p_value,
+        {"a": a, "b": b, "c": c, "d": d, "thresh": float(thresh)},
+    )
+
+
 def batch_aggregate(df, features):
     batch_prof = (
         df.groupby(["batch", "perturbation_id"])
@@ -144,6 +190,8 @@ def compute_metrics(embed_list, indir, orf=False):
         f"{target_label}_acc_NSBP@5",
         f"{target_label}_acc_NSBP@10",
         "pert_acc_NSB_random_baseline",
+        "odds_ratio_target_top5",
+        "p_value_target_top5",
         "repl_corr",
         "percent_95",
     ]
@@ -196,6 +244,11 @@ def compute_metrics(embed_list, indir, orf=False):
                 df, features, label_col="perturbation_id"
             )
 
+            # Odds ratio / p-value for target at top 5% similarity
+            or_val, p_val, _ = compute_odds_ratio_pvalue(
+                df, features, label_col=target_label, metric="cosine", top_percent=5
+            )
+
             # percent replicating and mean replicate correlation
             repl_corr, _, percent_95, _ = evl.percent_replicating(
                 df,
@@ -240,6 +293,8 @@ def compute_metrics(embed_list, indir, orf=False):
             dict_metrics[f"{target_label}_acc_NSBP@5"].append(target_acc_NSBP_at5)
             dict_metrics[f"{target_label}_acc_NSBP@10"].append(target_acc_NSBP_at10)
             dict_metrics["pert_acc_NSB_random_baseline"].append(pert_nsb_rand)
+            dict_metrics["odds_ratio_target_top5"].append(or_val)
+            dict_metrics["p_value_target_top5"].append(p_val)
             dict_metrics["repl_corr"].append(np.nanmean(repl_corr))
             dict_metrics["percent_95"].append(percent_95)
 
