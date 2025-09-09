@@ -1,6 +1,7 @@
 import os
 import argparse
 import numpy as np
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -769,6 +770,62 @@ class SimCLRWithGRL(SimCLR):
                         print("⚠️  mAP column not found in precision-recall output")
             except Exception as e:
                 print(f"⚠️  Perturbation mAP eval failed: {e}")
+
+            # Target odds ratio / p-value at top 5% similarity (mini-eval)
+            try:
+                if "target" in df.columns and df["target"].notnull().any():
+                    if df["target"].nunique(dropna=True) >= 2 and len(df) >= 30:
+                        # Standardize features
+                        X = StandardScaler().fit_transform(df[feature_cols].to_numpy())
+                        labels = LabelEncoder().fit_transform(
+                            df["target"].astype(str).values
+                        )
+                        # Cosine distance → similarity
+                        dist_mat = evl.pairwise_distances_parallel(X, metric="cosine")
+                        np.fill_diagonal(dist_mat, np.nan)
+                        sim = 1.0 - dist_mat
+                        n = sim.shape[0]
+                        iu, ju = np.triu_indices(n, k=1)
+                        sim_vals = sim[iu, ju]
+                        thresh = np.nanpercentile(sim_vals, 95.0)
+                        high = sim_vals >= thresh
+                        same = labels[iu] == labels[ju]
+                        a = int(np.nansum(np.logical_and(high, same)))
+                        c = int(np.nansum(np.logical_and(high, ~same)))
+                        b = int(np.nansum(np.logical_and(~high, same)))
+                        d = int(np.nansum(np.logical_and(~high, ~same)))
+                        aa, bb, cc, dd = a, b, c, d
+                        if min(aa, bb, cc, dd) == 0:
+                            aa += 0.5
+                            bb += 0.5
+                            cc += 0.5
+                            dd += 0.5
+                        odds_ratio = (aa / bb) / (cc / dd)
+
+                        # Hypergeometric p-value (single table) in log-space
+                        def _logcomb(n, k):
+                            return (
+                                math.lgamma(n + 1)
+                                - math.lgamma(k + 1)
+                                - math.lgamma(n - k + 1)
+                            )
+
+                        logp = (
+                            _logcomb(a + b, a)
+                            + _logcomb(c + d, c)
+                            - _logcomb(a + b + c + d, a + c)
+                        )
+                        p_value = float(np.exp(logp))
+                        self.log("val_target_odds_ratio_top5", float(odds_ratio))
+                        self.log("val_target_p_value_top5", float(p_value))
+                    else:
+                        print(
+                            "⚠️  mini-eval: insufficient target diversity/samples for OR/p-value"
+                        )
+                else:
+                    print("⚠️  mini-eval: 'target' column missing for OR/p-value")
+            except Exception as e:
+                print(f"⚠️  Target OR/p-value eval failed: {e}")
 
             # Early-stop checkpointing at leakage trough (uses adversary label AUC)
             try:
