@@ -2,6 +2,7 @@ import os
 import argparse
 import numpy as np
 import math
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -204,6 +205,11 @@ class SimCLRWithGRL(SimCLR):
         lambda_delay_frac = kwargs.pop("lambda_delay_frac", 0.2)
         domain_head_dropout = kwargs.pop("domain_head_dropout", 0.1)
         domain_label_key = kwargs.pop("domain_label_key", "batch")
+        # Anti-forgetting weights
+        distill_weight = kwargs.pop("distill_weight", 0.5)
+        rel_kd_weight = kwargs.pop("rel_kd_weight", 0.1)
+        l2sp_weight = kwargs.pop("l2sp_weight", 1e-3)
+        adapter_anchor_weight = kwargs.pop("adapter_anchor_weight", 1e-4)
 
         super().__init__(**kwargs)
         self.num_domains = int(num_domains)
@@ -218,6 +224,11 @@ class SimCLRWithGRL(SimCLR):
         self.lambda_delay_frac = float(lambda_delay_frac)
         self.domain_head_dropout = float(domain_head_dropout)
         self.domain_label_key = str(domain_label_key)
+        # Store anti-forgetting weights
+        self.distill_weight = float(distill_weight)
+        self.rel_kd_weight = float(rel_kd_weight)
+        self.l2sp_weight = float(l2sp_weight)
+        self.adapter_anchor_weight = float(adapter_anchor_weight)
         if hasattr(self, "hparams"):
             try:
                 self.hparams.projector_lr = self.projector_lr
@@ -226,6 +237,10 @@ class SimCLRWithGRL(SimCLR):
                 self.hparams.lambda_delay_frac = self.lambda_delay_frac
                 self.hparams.domain_head_dropout = self.domain_head_dropout
                 self.hparams.domain_label_key = self.domain_label_key
+                self.hparams.distill_weight = self.distill_weight
+                self.hparams.rel_kd_weight = self.rel_kd_weight
+                self.hparams.l2sp_weight = self.l2sp_weight
+                self.hparams.adapter_anchor_weight = self.adapter_anchor_weight
             except Exception:
                 pass
 
@@ -264,6 +279,29 @@ class SimCLRWithGRL(SimCLR):
             p.requires_grad = True
         for p in self.domain_head.parameters():
             p.requires_grad = True
+
+        # Teacher/backbone anchor placeholders (to be initialized after loading ckpt)
+        self.teacher_backbone = None
+        self.backbone_init_state = None
+
+    def initialize_teacher(self):
+        """Freeze a teacher from the current backbone and snapshot initial weights for L2-SP.
+
+        Call this AFTER loading the pretrained checkpoint.
+        """
+        try:
+            self.teacher_backbone = copy.deepcopy(self.backbone).to(self.device)
+            self.teacher_backbone.eval()
+            for p in self.teacher_backbone.parameters():
+                p.requires_grad = False
+            # Snapshot initial backbone weights for optional L2-SP
+            self.backbone_init_state = {
+                name: p.detach().clone().to(self.device)
+                for name, p in self.backbone.named_parameters()
+            }
+            print("🧊 Initialized frozen teacher backbone and L2-SP anchors")
+        except Exception as e:
+            print(f"⚠️  Failed to initialize teacher/backbone anchors: {e}")
 
     def configure_optimizers(self):
         # Parameter groups with different learning rates
@@ -538,8 +576,75 @@ class SimCLRWithGRL(SimCLR):
             adapted, domain_targets, mode="train"
         )
 
-        # Combine losses without additional weighting (lambda is in GRL)
-        total_loss = simclr_loss + self.domain_loss_weight * domain_loss
+        # Anti-forgetting regularizers (Feature KD, Relational KD, Adapter anchor, L2-SP)
+        kd_feat_loss = torch.tensor(0.0, device=self.device)
+        rel_kd_loss = torch.tensor(0.0, device=self.device)
+        adapter_anchor_loss = torch.tensor(0.0, device=self.device)
+        l2sp_loss = torch.tensor(0.0, device=self.device)
+
+        # Feature KD and Relational KD against frozen teacher
+        if getattr(self, "teacher_backbone", None) is not None and (
+            self.distill_weight > 0.0 or self.rel_kd_weight > 0.0
+        ):
+            with torch.no_grad():
+                teacher_feats = self.teacher_backbone(imgs)
+            # Feature KD: match adapted export to teacher backbone features
+            if self.distill_weight > 0.0:
+                kd_feat_loss = F.mse_loss(adapted, teacher_feats)
+                self.log("train_kd_feat_loss", kd_feat_loss, prog_bar=False)
+            # Relational KD: match cosine similarity structure
+            if self.rel_kd_weight > 0.0:
+                s_student = (
+                    F.normalize(adapted, dim=1) @ F.normalize(adapted, dim=1).t()
+                )
+                s_teacher = (
+                    F.normalize(teacher_feats, dim=1)
+                    @ F.normalize(teacher_feats, dim=1).t()
+                )
+                rel_kd_loss = F.mse_loss(s_student, s_teacher)
+                self.log("train_rel_kd_loss", rel_kd_loss, prog_bar=False)
+
+        # Adapter anchor: keep adapter delta small
+        if self.adapter_anchor_weight > 0.0:
+            with torch.no_grad():
+                base_feats = self.backbone(imgs)
+            adapter_delta = adapted - base_feats
+            adapter_anchor_loss = adapter_delta.pow(2).mean()
+            self.log("train_adapter_anchor_loss", adapter_anchor_loss, prog_bar=False)
+
+        # L2-SP: only if any backbone params are trainable
+        if self.l2sp_weight > 0.0 and any(
+            p.requires_grad for p in self.backbone.parameters()
+        ):
+            try:
+                accum = 0.0
+                count = 0
+                for name, p in self.backbone.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if (
+                        self.backbone_init_state is None
+                        or name not in self.backbone_init_state
+                    ):
+                        continue
+                    p0 = self.backbone_init_state[name]
+                    accum = accum + (p - p0).pow(2).mean()
+                    count += 1
+                if count > 0:
+                    l2sp_loss = accum / float(count)
+                    self.log("train_l2sp_loss", l2sp_loss, prog_bar=False)
+            except Exception as e:
+                print(f"⚠️  L2-SP computation failed: {e}")
+
+        # Combine losses
+        total_loss = (
+            simclr_loss
+            + self.domain_loss_weight * domain_loss
+            + self.distill_weight * kd_feat_loss
+            + self.rel_kd_weight * rel_kd_loss
+            + self.l2sp_weight * l2sp_loss
+            + self.adapter_anchor_weight * adapter_anchor_loss
+        )
         self.log("train_total_loss", total_loss, prog_bar=True)
 
         # Log GRL lambda for tracking
@@ -1092,6 +1197,31 @@ def main():
         default=1.0,
         help="Weight of the CE loss of the domain loss in the total loss",
     )
+    # Anti-forgetting weights
+    parser.add_argument(
+        "--distill_weight",
+        type=float,
+        default=0.5,
+        help="Weight for feature knowledge distillation (student adapted vs teacher backbone)",
+    )
+    parser.add_argument(
+        "--rel_kd_weight",
+        type=float,
+        default=0.1,
+        help="Weight for relational KD (match cosine-similarity matrices)",
+    )
+    parser.add_argument(
+        "--l2sp_weight",
+        type=float,
+        default=1e-3,
+        help="Weight for L2-SP on any unfrozen backbone params",
+    )
+    parser.add_argument(
+        "--adapter_anchor_weight",
+        type=float,
+        default=1e-4,
+        help="Weight for adapter anchor penalty (keep adapter delta small)",
+    )
 
     args = parser.parse_args()
 
@@ -1129,6 +1259,11 @@ def main():
     adapter_hidden = args.adapter_hidden
     adapter_scale = args.adapter_scale
     domain_loss_weight = args.domain_loss_weight
+    # Anti-forgetting
+    distill_weight = args.distill_weight
+    rel_kd_weight = args.rel_kd_weight
+    l2sp_weight = args.l2sp_weight
+    adapter_anchor_weight = args.adapter_anchor_weight
 
     print("📋 CONFIGURATION:")
     print(f"  - Submission CSV: {submission_csv}")
@@ -1272,6 +1407,10 @@ def main():
                 "projector_lr": args.projector_lr,
                 "head_lr_scale": args.head_lr_scale,
                 "head_update_every": args.head_update_every,
+                "distill_weight": distill_weight,
+                "rel_kd_weight": rel_kd_weight,
+                "l2sp_weight": l2sp_weight,
+                "adapter_anchor_weight": adapter_anchor_weight,
             }
         )
 
@@ -1338,6 +1477,10 @@ def main():
         lambda_delay_frac=args.lambda_delay_frac,
         domain_head_dropout=args.domain_head_dropout,
         domain_label_key=domain_label_key,
+        distill_weight=distill_weight,
+        rel_kd_weight=rel_kd_weight,
+        l2sp_weight=l2sp_weight,
+        adapter_anchor_weight=adapter_anchor_weight,
     )
     print(f"  - Architecture: {args.arch}")
     print(f"  - Hidden dim: {hidden_dim}")
@@ -1429,6 +1572,12 @@ def main():
             f"  - Unexpected keys: {unexpected[:5]}..."
         )  # Show first 5 unexpected keys
     print()
+
+    # Initialize frozen teacher and L2-SP anchors from the just-loaded backbone
+    try:
+        model.initialize_teacher()
+    except Exception as e:
+        print(f"⚠️  initialize_teacher failed: {e}")
 
     # Fit
     print("🎯 STARTING TRAINING...")
