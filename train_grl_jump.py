@@ -719,6 +719,45 @@ class SimCLRWithGRL(SimCLR):
                 except Exception as e:
                     print(f"⚠️  NSB perturbation eval failed: {e}")
 
+            # Target accuracies: NSP (NSW) and NSBP (NSBW)
+            try:
+                if "target" in df.columns and df["target"].notnull().any():
+                    X_t = StandardScaler().fit_transform(df[feature_cols].to_numpy())
+                    y_t = LabelEncoder().fit_transform(df["target"].astype(str).values)
+                    wells = (
+                        df["well"].astype(str).values
+                        if "well" in df.columns
+                        else np.array([""] * len(df))
+                    )
+                    batches_t = (
+                        df["batch"].astype(str).values
+                        if "batch" in df.columns
+                        else np.array([""] * len(df))
+                    )
+                    # NSP ~ NSW in code: exclude same well
+                    ypred_nsp = evl.nearest_neighbor_classifier_NSBW(
+                        X_t, y_t, mode="NSW", wells=wells, metric="cosine"
+                    )
+                    nsp_acc = (ypred_nsp == y_t).mean()
+                    self.log("val_target_acc_NSP", float(nsp_acc))
+                    # NSBP ~ NSBW in code: exclude same batch and same well
+                    ypred_nsbp = evl.nearest_neighbor_classifier_NSBW(
+                        X_t,
+                        y_t,
+                        mode="NSBW",
+                        batches=batches_t,
+                        wells=wells,
+                        metric="cosine",
+                    )
+                    nsbp_acc = (ypred_nsbp == y_t).mean()
+                    self.log("val_target_acc_NSBP", float(nsbp_acc))
+                else:
+                    print(
+                        "⚠️  mini-eval: 'target' not available for target accuracy logging"
+                    )
+            except Exception as e:
+                print(f"⚠️  Target accuracy eval failed: {e}")
+
             # Perturbation mAP (aggregated)
             try:
                 # Keep only valid perturbation IDs with at least 2 samples
