@@ -570,7 +570,7 @@ class SimCLRWithGRL(SimCLR):
         _ = self._domain_loss_and_metrics(adapted, domain_targets, mode="val")
 
     def _mini_eval_and_log(self):
-        """Run a lightweight validation-style eval on a few val batches and log metrics."""
+        """Run a validation-style eval over the entire val loader and log metrics."""
         try:
             val_dls = getattr(self.trainer, "val_dataloaders", None)
             if val_dls is None:
@@ -594,8 +594,6 @@ class SimCLRWithGRL(SimCLR):
             self.eval()
             device = self.device
             rows = []
-            max_batches = 10  # sample more batches to improve diversity
-            batches_done = 0
             with torch.no_grad():
                 for batch in val_loader:
                     try:
@@ -651,18 +649,7 @@ class SimCLRWithGRL(SimCLR):
                             row[f"emb{j}"] = float(v)
                         rows.append(row)
 
-                    batches_done += 1
-
-                    # Early stop if we have enough diversity
-                    if batches_done >= max_batches:
-                        break
-                    if len(rows) >= 200:
-                        df_tmp = pd.DataFrame(rows)
-                        if (
-                            df_tmp.get("batch").nunique(dropna=True) >= 2
-                            and df_tmp.get("perturbation_id").nunique(dropna=True) >= 2
-                        ):
-                            break
+                    # continue through entire val_loader for more stable mini-eval
 
             if len(rows) < 20:
                 return
