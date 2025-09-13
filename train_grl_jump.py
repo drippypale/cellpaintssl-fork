@@ -958,26 +958,54 @@ class SimCLRWithGRL(SimCLR):
             except Exception as e:
                 print(f"⚠️  Target OR/p-value eval failed: {e}")
 
-            # Early-stop checkpointing at leakage trough (uses adversary label AUC)
+            # Early-stop checkpointing using target accuracy (NSP, NSBP) as primary criteria
             try:
-                if (
-                    batch_auc_val is not None
-                    and nsb_acc_val is not None
-                    and not np.isnan(batch_auc_val)
-                ):
-                    improved_auc = batch_auc_val < (self.best_batch_auc - 1e-6)
-                    nsb_not_worse = nsb_acc_val >= (self.best_nsb_at_auc - 1e-6)
-                    if improved_auc and nsb_not_worse:
-                        self.best_batch_auc = batch_auc_val
-                        self.best_nsb_at_auc = nsb_acc_val
+                # Pull the most recently logged target accuracies from LoggerCollection
+                # We compute both NSP and NSBP; prefer NSBP, fallback to NSP.
+                nsp = self.trainer.callback_metrics.get("val_target_acc_NSP", None)
+                nsbp = self.trainer.callback_metrics.get("val_target_acc_NSBP", None)
+                target_metric = None
+                if nsbp is not None and not torch.isnan(nsbp):
+                    target_metric = float(nsbp.detach().cpu().item())
+                    target_name = "NSBP"
+                elif nsp is not None and not torch.isnan(nsp):
+                    target_metric = float(nsp.detach().cpu().item())
+                    target_name = "NSP"
+
+                if target_metric is not None:
+                    # Keep best target accuracy, break ties by lower leakage AUC if available
+                    best_key = f"best_target_acc_{target_name.lower()}"
+                    current_best = getattr(self, best_key, -1.0)
+                    leakage = (
+                        batch_auc_val
+                        if (batch_auc_val is not None and not np.isnan(batch_auc_val))
+                        else None
+                    )
+
+                    better_target = target_metric > (current_best + 1e-6)
+                    tie_break = (
+                        (not better_target)
+                        and abs(target_metric - current_best) <= 1e-6
+                        and (
+                            leakage is not None
+                            and leakage < (self.best_batch_auc - 1e-6)
+                        )
+                    )
+                    if better_target or tie_break:
+                        setattr(self, best_key, target_metric)
+                        if leakage is not None:
+                            self.best_batch_auc = leakage
                         ckpt_dir = self.trainer.default_root_dir or "."
-                        fname = f"earlystop_epoch{self.current_epoch:02d}_auc{batch_auc_val:.4f}_nsb{nsb_acc_val:.4f}.ckpt"
+                        fname = f"earlystop_epoch{self.current_epoch:02d}_target{target_name}_{target_metric:.4f}.ckpt"
                         path = os.path.join(ckpt_dir, fname)
                         self.trainer.save_checkpoint(path)
-                        print(f"💾 Saved early-stop checkpoint at AUC trough: {path}")
+                        print(
+                            f"💾 Saved early-stop checkpoint on best target {target_name}: {path}"
+                        )
                         # Log best-so-far values
-                        self.log("val_best_batch_ROC_AUC", self.best_batch_auc)
-                        self.log("val_best_nsb_at_auc", self.best_nsb_at_auc)
+                        self.log(f"val_best_target_acc_{target_name}", target_metric)
+                        if leakage is not None:
+                            self.log("val_best_batch_ROC_AUC", self.best_batch_auc)
             except Exception as e:
                 print(f"⚠️  Early-stop checkpointing failed: {e}")
         except Exception as e:
