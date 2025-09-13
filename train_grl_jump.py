@@ -1579,6 +1579,243 @@ def main():
     except Exception as e:
         print(f"⚠️  initialize_teacher failed: {e}")
 
+    # ------------------------------------------------------------------
+    # Baseline (pretrained) validation logging BEFORE training starts
+    # Uses backbone features only (no adapter) to reflect pretrained baseline
+    # ------------------------------------------------------------------
+    try:
+        print("🧪 Running baseline validation (pretrained backbone) before training...")
+        model.eval()
+        device = model.device
+        rows = []
+        with torch.no_grad():
+            for batch in val_loader:
+                try:
+                    imgs, metadata_collated, _domain = batch
+                except Exception:
+                    try:
+                        imgs, metadata_collated = batch
+                    except Exception:
+                        break
+
+                # use first view only for embedding consistency
+                view = imgs[0] if isinstance(imgs, (list, tuple)) else imgs
+                view = view.to(device)
+
+                backbone_feats = model.backbone(view)
+                embs = backbone_feats.detach().cpu().numpy()
+
+                B = embs.shape[0]
+                for i in range(B):
+                    meta = {}
+                    if isinstance(metadata_collated, dict):
+                        for k in ("batch", "plate", "well", "compound", "target"):
+                            try:
+                                seq = metadata_collated.get(k, None)
+                                meta[k] = (
+                                    seq[i]
+                                    if isinstance(seq, list) and len(seq) > i
+                                    else None
+                                )
+                            except Exception:
+                                meta[k] = None
+                    elif (
+                        isinstance(metadata_collated, (list, tuple))
+                        and len(metadata_collated) > i
+                    ):
+                        md = metadata_collated[i]
+                        if isinstance(md, dict):
+                            meta = md
+
+                    row = {
+                        "batch": meta.get("batch", None),
+                        "plate": meta.get("plate", None),
+                        "well": meta.get("well", None),
+                        "perturbation_id": meta.get("compound", None),
+                        "target": meta.get("target", None),
+                    }
+                    for j, v in enumerate(embs[i]):
+                        row[f"emb{j}"] = float(v)
+                    rows.append(row)
+
+        baseline_metrics = {}
+        if len(rows) >= 20:
+            df = pd.DataFrame(rows)
+            feature_cols = [c for c in df.columns if c.startswith("emb")]
+
+            # Leakage proxies for multiple labels
+            for label_key in ["batch", "source", "plate"]:
+                try:
+                    if label_key not in df.columns:
+                        continue
+                    if df.get(label_key).nunique(dropna=True) < 2:
+                        continue
+                    df_for_label = df.copy()
+                    df_for_label["batch"] = df_for_label[label_key].astype(str)
+                    metrics = evl.batch_classification(df_for_label)
+                    baseline_metrics[f"baseline_leak_{label_key}_MCC"] = float(
+                        metrics.get("MCC", float("nan"))
+                    )
+                    baseline_metrics[f"baseline_leak_{label_key}_ROC_AUC"] = float(
+                        metrics.get("ROC_AUC", float("nan"))
+                    )
+                except Exception:
+                    pass
+
+            # NSB perturbation accuracy
+            try:
+                if (
+                    "perturbation_id" in df.columns
+                    and df["perturbation_id"].notnull().any()
+                ):
+                    X = StandardScaler().fit_transform(df[feature_cols].to_numpy())
+                    y = LabelEncoder().fit_transform(
+                        df["perturbation_id"].astype(str).values
+                    )
+                    batches_base = (
+                        df["batch"].astype(str).values
+                        if "batch" in df.columns
+                        else np.array([""] * len(df))
+                    )
+                    if len(np.unique(batches_base)) >= 2:
+                        ypred_nsb = evl.nearest_neighbor_classifier_NSBW(
+                            X, y, mode="NSB", batches=batches_base, metric="cosine"
+                        )
+                        baseline_metrics["baseline_pert_acc_NSB"] = float(
+                            (ypred_nsb == y).mean()
+                        )
+            except Exception:
+                pass
+
+            # Target accuracies: NSP/NSBP
+            try:
+                if "target" in df.columns and df["target"].notnull().any():
+                    X_t = StandardScaler().fit_transform(df[feature_cols].to_numpy())
+                    y_t = LabelEncoder().fit_transform(df["target"].astype(str).values)
+                    wells = (
+                        df["well"].astype(str).values
+                        if "well" in df.columns
+                        else np.array([""] * len(df))
+                    )
+                    batches_t = (
+                        df["batch"].astype(str).values
+                        if "batch" in df.columns
+                        else np.array([""] * len(df))
+                    )
+                    ypred_nsp = evl.nearest_neighbor_classifier_NSBW(
+                        X_t, y_t, mode="NSW", wells=wells, metric="cosine"
+                    )
+                    baseline_metrics["baseline_target_acc_NSP"] = float(
+                        (ypred_nsp == y_t).mean()
+                    )
+                    ypred_nsbp = evl.nearest_neighbor_classifier_NSBW(
+                        X_t,
+                        y_t,
+                        mode="NSBW",
+                        batches=batches_t,
+                        wells=wells,
+                        metric="cosine",
+                    )
+                    baseline_metrics["baseline_target_acc_NSBP"] = float(
+                        (ypred_nsbp == y_t).mean()
+                    )
+            except Exception:
+                pass
+
+            # Perturbation mAP (aggregated)
+            try:
+                df_valid = df[
+                    df["perturbation_id"].notnull()
+                    & (df["perturbation_id"].astype(str) != "")
+                ].copy()
+                vc = df_valid["perturbation_id"].value_counts()
+                keep_ids = set(vc[vc >= 2].index.tolist())
+                df_valid = df_valid[df_valid["perturbation_id"].isin(keep_ids)].copy()
+                if df_valid["perturbation_id"].nunique() >= 2:
+                    agg = (
+                        df_valid.groupby(["perturbation_id"])
+                        .mean(numeric_only=True)
+                        .reset_index()
+                    )
+                    Xagg = StandardScaler().fit_transform(agg[feature_cols].to_numpy())
+                    agg_std = agg.copy()
+                    for j, c in enumerate(feature_cols):
+                        agg_std[c] = Xagg[:, j]
+                    pr_k, pr_dist = evl.calculate_precision_recall(
+                        agg_std, feature_cols, label_col="perturbation_id"
+                    )
+                    if "mAP" in pr_dist.columns:
+                        mAP_val = float(pr_dist["mAP"].iloc[0])
+                        if not np.isnan(mAP_val):
+                            baseline_metrics["baseline_pert_mAP"] = mAP_val
+            except Exception:
+                pass
+
+            # Target odds ratio / p-value at top 5% similarity
+            try:
+                if "target" in df.columns and df["target"].notnull().any():
+                    if df["target"].nunique(dropna=True) >= 2 and len(df) >= 30:
+                        X = StandardScaler().fit_transform(df[feature_cols].to_numpy())
+                        labels = LabelEncoder().fit_transform(
+                            df["target"].astype(str).values
+                        )
+                        dist_mat = evl.pairwise_distances_parallel(X, metric="cosine")
+                        np.fill_diagonal(dist_mat, np.nan)
+                        sim = 1.0 - dist_mat
+                        n = sim.shape[0]
+                        iu, ju = np.triu_indices(n, k=1)
+                        sim_vals = sim[iu, ju]
+                        thresh = np.nanpercentile(sim_vals, 95.0)
+                        high = sim_vals >= thresh
+                        same = labels[iu] == labels[ju]
+                        a = int(np.nansum(np.logical_and(high, same)))
+                        c = int(np.nansum(np.logical_and(high, ~same)))
+                        b = int(np.nansum(np.logical_and(~high, same)))
+                        d = int(np.nansum(np.logical_and(~high, ~same)))
+                        aa, bb, cc, dd = a, b, c, d
+                        if min(aa, bb, cc, dd) == 0:
+                            aa += 0.5
+                            bb += 0.5
+                            cc += 0.5
+                            dd += 0.5
+                        odds_ratio = (aa / bb) / (cc / dd)
+
+                        def _logcomb(n, k):
+                            return (
+                                math.lgamma(n + 1)
+                                - math.lgamma(k + 1)
+                                - math.lgamma(n - k + 1)
+                            )
+
+                        logp = (
+                            _logcomb(a + b, a)
+                            + _logcomb(c + d, c)
+                            - _logcomb(a + b + c + d, a + c)
+                        )
+                        p_value = float(np.exp(logp))
+                        baseline_metrics["baseline_target_odds_ratio_top5"] = float(
+                            odds_ratio
+                        )
+                        baseline_metrics["baseline_target_p_value_top5"] = float(
+                            p_value
+                        )
+            except Exception:
+                pass
+
+        # Log to wandb (if enabled)
+        if args.use_wandb and baseline_metrics:
+            try:
+                wandb_logger.experiment.log(baseline_metrics, step=0)
+                print(
+                    f"✅ Baseline metrics logged to wandb: {list(baseline_metrics.keys())}"
+                )
+            except Exception as e:
+                print(f"⚠️  Failed to log baseline metrics to wandb: {e}")
+        else:
+            print("ℹ️  Baseline metrics (preview):", baseline_metrics)
+    except Exception as e:
+        print(f"⚠️  Baseline validation failed: {e}")
+
     # Fit
     print("🎯 STARTING TRAINING...")
     print("=" * 80)
