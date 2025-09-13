@@ -1613,6 +1613,7 @@ def main():
     # ------------------------------------------------------------------
     try:
         print("🧪 Running baseline validation (pretrained backbone) before training...")
+        prev_mode = model.training
         model.eval()
         device = model.device
         rows = []
@@ -1843,6 +1844,14 @@ def main():
             print("ℹ️  Baseline metrics (preview):", baseline_metrics)
     except Exception as e:
         print(f"⚠️  Baseline validation failed: {e}")
+    finally:
+        # Restore prior training mode for the model, but keep teacher in eval
+        try:
+            model.train(prev_mode)
+            if getattr(model, "teacher_backbone", None) is not None:
+                model.teacher_backbone.eval()
+        except Exception:
+            pass
 
     # Fit
     print("🎯 STARTING TRAINING...")
