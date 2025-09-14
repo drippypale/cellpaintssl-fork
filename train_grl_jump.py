@@ -210,6 +210,10 @@ class SimCLRWithGRL(SimCLR):
         rel_kd_weight = kwargs.pop("rel_kd_weight", 0.1)
         l2sp_weight = kwargs.pop("l2sp_weight", 1e-3)
         adapter_anchor_weight = kwargs.pop("adapter_anchor_weight", 1e-4)
+        # Triplet loss params
+        triplet_weight = kwargs.pop("triplet_weight", 0.0)
+        triplet_margin = kwargs.pop("triplet_margin", 0.2)
+        triplet_metric = kwargs.pop("triplet_metric", "cosine")
 
         super().__init__(**kwargs)
         self.num_domains = int(num_domains)
@@ -229,6 +233,10 @@ class SimCLRWithGRL(SimCLR):
         self.rel_kd_weight = float(rel_kd_weight)
         self.l2sp_weight = float(l2sp_weight)
         self.adapter_anchor_weight = float(adapter_anchor_weight)
+        # Triplet
+        self.triplet_weight = float(triplet_weight)
+        self.triplet_margin = float(triplet_margin)
+        self.triplet_metric = str(triplet_metric)
         if hasattr(self, "hparams"):
             try:
                 self.hparams.projector_lr = self.projector_lr
@@ -241,6 +249,9 @@ class SimCLRWithGRL(SimCLR):
                 self.hparams.rel_kd_weight = self.rel_kd_weight
                 self.hparams.l2sp_weight = self.l2sp_weight
                 self.hparams.adapter_anchor_weight = self.adapter_anchor_weight
+                self.hparams.triplet_weight = self.triplet_weight
+                self.hparams.triplet_margin = self.triplet_margin
+                self.hparams.triplet_metric = self.triplet_metric
             except Exception:
                 pass
 
@@ -283,6 +294,135 @@ class SimCLRWithGRL(SimCLR):
         # Teacher/backbone anchor placeholders (to be initialized after loading ckpt)
         self.teacher_backbone = None
         self.backbone_init_state = None
+
+    def _batch_hard_triplet_loss(
+        self, features_first_view, metadata_collated, mode: str
+    ):
+        """Compute batch-hard triplet loss over first-view features using 'target' labels.
+
+        Args:
+            features_first_view: Tensor [B, D] (no concat of views)
+            metadata_collated: dict of lists with key 'target'
+        Returns:
+            loss: scalar tensor
+        """
+        weight = float(getattr(self, "triplet_weight", 0.0))
+        if weight <= 0.0:
+            return torch.tensor(0.0, device=features_first_view.device)
+
+        targets_list = []
+        try:
+            targets_list = (
+                metadata_collated.get("target", [])
+                if isinstance(metadata_collated, dict)
+                else []
+            )
+        except Exception:
+            targets_list = []
+
+        B = features_first_view.shape[0]
+        if not isinstance(targets_list, list) or len(targets_list) != B:
+            # Can't compute
+            loss = torch.tensor(0.0, device=features_first_view.device)
+            self.log(mode + "_triplet_loss", loss, prog_bar=False)
+            return loss
+
+        # Normalize and filter invalid targets
+        labels = []
+        for t in targets_list:
+            if t is None:
+                labels.append("")
+            else:
+                labels.append(str(t))
+        # No need for an indices tensor; compute directly on features
+
+        # Build mask of valid entries (non-empty targets)
+        valid_mask = torch.tensor(
+            [
+                label_str.strip() != "" and label_str.lower() != "nan"
+                for label_str in labels
+            ],
+            device=features_first_view.device,
+        )
+        if valid_mask.sum().item() < 2:
+            loss = torch.tensor(0.0, device=features_first_view.device)
+            self.log(mode + "_triplet_loss", loss, prog_bar=False)
+            return loss
+
+        # Map string labels to per-batch ids on CPU for grouping
+        uniq = {}
+        mapped = []
+        for label_str in labels:
+            if label_str.strip() == "" or label_str.lower() == "nan":
+                mapped.append(-1)
+            else:
+                if label_str not in uniq:
+                    uniq[label_str] = len(uniq)
+                mapped.append(uniq[label_str])
+        y = torch.tensor(mapped, device=features_first_view.device, dtype=torch.long)
+
+        # Restrict to valid indices where label >=0
+        idx = torch.nonzero(
+            torch.logical_and(valid_mask, y >= 0), as_tuple=False
+        ).squeeze(1)
+        if idx.numel() < 2:
+            loss = torch.tensor(0.0, device=features_first_view.device)
+            self.log(mode + "_triplet_loss", loss, prog_bar=False)
+            return loss
+
+        X = features_first_view[idx]
+        y_idx = y[idx]
+
+        # Need at least one class with count>=2 and at least 2 classes
+        classes, counts = torch.unique(y_idx, return_counts=True)
+        if (counts >= 2).sum().item() == 0 or classes.numel() < 2:
+            loss = torch.tensor(0.0, device=features_first_view.device)
+            self.log(mode + "_triplet_loss", loss, prog_bar=False)
+            return loss
+
+        # Compute pairwise distances
+        if getattr(self, "triplet_metric", "cosine") == "cosine":
+            Xn = F.normalize(X, dim=1)
+            sim = torch.matmul(Xn, Xn.t())  # [M,M]
+            dist = 1.0 - sim
+            dist = dist.clamp_min(0.0)
+        else:
+            dist = torch.cdist(X, X, p=2)
+
+        M = dist.shape[0]
+        # Build same/diff label masks
+        y_col = y_idx.view(-1, 1)
+        same = y_col.eq(y_col.t())
+        # Exclude self from positives
+        diag = torch.eye(M, dtype=torch.bool, device=dist.device)
+        same = same & (~diag)
+        # Note: negatives are implicitly handled via ~same and min over masked distances
+
+        # For anchors with no positive or no negative, skip
+        has_pos = same.any(dim=1)
+        has_neg = (~same).any(dim=1)
+        valid_anchor = has_pos & has_neg
+        if valid_anchor.sum().item() == 0:
+            loss = torch.tensor(0.0, device=features_first_view.device)
+            self.log(mode + "_triplet_loss", loss, prog_bar=False)
+            return loss
+
+        # Hardest positive: max distance among positives
+        pos_dist = dist.masked_fill(~same, float("-inf")).max(dim=1).values
+        # Hardest negative: min distance among negatives (exclude positives and self)
+        neg_mask = (~same) & (~diag)
+        neg_dist = dist.masked_fill(~neg_mask, float("inf")).min(dim=1).values
+
+        margin = float(getattr(self, "triplet_margin", 0.2))
+        triplet = F.relu(pos_dist - neg_dist + margin)
+        triplet = triplet[valid_anchor]
+        if triplet.numel() == 0:
+            loss = torch.tensor(0.0, device=features_first_view.device)
+            self.log(mode + "_triplet_loss", loss, prog_bar=False)
+            return loss
+        loss = triplet.mean()
+        self.log(mode + "_triplet_loss", loss, prog_bar=(mode == "train"))
+        return loss
 
     def initialize_teacher(self):
         """Freeze a teacher from the current backbone and snapshot initial weights for L2-SP.
@@ -556,7 +696,7 @@ class SimCLRWithGRL(SimCLR):
                 f"  [TRAIN] Epoch {self.current_epoch}, Batch {batch_idx}/{self.trainer.num_training_batches}"
             )
 
-        imgs, _, domain_labels = batch
+        imgs, metadata_collated, domain_labels = batch
         # imgs is a list of two views; concatenate across batch dimension
         imgs = torch.cat(imgs, dim=0)
 
@@ -636,16 +776,35 @@ class SimCLRWithGRL(SimCLR):
             except Exception as e:
                 print(f"⚠️  L2-SP computation failed: {e}")
 
+        # Triplet loss on first-view adapted embeddings
+        triplet_loss = torch.tensor(0.0, device=self.device)
+        try:
+            Bfirst = imgs.shape[0] // 2
+            first_view_adapted = adapted[:Bfirst]
+            triplet_loss = self._batch_hard_triplet_loss(
+                first_view_adapted, metadata_collated, mode="train"
+            )
+        except Exception as e:
+            if batch_idx % 10 == 0:
+                print(f"⚠️  Triplet loss (train) failed: {e}")
+
         # Combine losses
         total_loss = (
             simclr_loss
             + self.domain_loss_weight * domain_loss
+            + self.triplet_weight * triplet_loss
             + self.distill_weight * kd_feat_loss
             + self.rel_kd_weight * rel_kd_loss
             + self.l2sp_weight * l2sp_loss
             + self.adapter_anchor_weight * adapter_anchor_loss
         )
         self.log("train_total_loss", total_loss, prog_bar=True)
+        if float(getattr(self, "triplet_weight", 0.0)) > 0.0:
+            self.log(
+                "train_triplet_loss_weighted",
+                self.triplet_weight * triplet_loss,
+                prog_bar=False,
+            )
 
         # Log GRL lambda for tracking
         self.log("train_grl_lambda", self.grl.lambd, prog_bar=False)
@@ -664,7 +823,7 @@ class SimCLRWithGRL(SimCLR):
         if batch_idx % 2 == 0:  # Print every 2 validation batches
             print(f"  [VAL] Epoch {self.current_epoch}, Batch {batch_idx}")
 
-        imgs, _, domain_labels = batch
+        imgs, metadata_collated, domain_labels = batch
         imgs = torch.cat(imgs, dim=0)
         feats, penultimate, adapted = self._forward_embeddings(imgs)
         _ = self._simclr_loss_and_metrics(feats, mode="val")
@@ -673,6 +832,22 @@ class SimCLRWithGRL(SimCLR):
         )
         domain_targets = torch.cat([domain_targets, domain_targets], dim=0)
         _ = self._domain_loss_and_metrics(adapted, domain_targets, mode="val")
+        # Triplet loss on first-view embeddings only (for logging)
+        try:
+            Bfirst = imgs.shape[0]
+            first_view_adapted = adapted[:Bfirst]
+            triplet_loss_val = self._batch_hard_triplet_loss(
+                first_view_adapted, metadata_collated, mode="val"
+            )
+            if float(getattr(self, "triplet_weight", 0.0)) > 0.0:
+                self.log(
+                    "val_triplet_loss_weighted",
+                    self.triplet_weight * triplet_loss_val,
+                    prog_bar=False,
+                )
+        except Exception as e:
+            if batch_idx % 10 == 0:
+                print(f"⚠️  Triplet loss (val) failed: {e}")
 
     def _mini_eval_and_log(self):
         """Run a validation-style eval over the entire val loader and log metrics."""
@@ -1251,6 +1426,27 @@ def main():
         help="Weight for adapter anchor penalty (keep adapter delta small)",
     )
 
+    # Triplet loss (target-separating) parameters
+    parser.add_argument(
+        "--triplet_weight",
+        type=float,
+        default=0.0,
+        help="Weight for batch-hard triplet loss (0 disables)",
+    )
+    parser.add_argument(
+        "--triplet_margin",
+        type=float,
+        default=0.2,
+        help="Margin for triplet loss",
+    )
+    parser.add_argument(
+        "--triplet_metric",
+        type=str,
+        default="cosine",
+        choices=["cosine", "euclidean"],
+        help="Distance metric for triplet loss",
+    )
+
     args = parser.parse_args()
 
     print("=" * 80)
@@ -1292,6 +1488,10 @@ def main():
     rel_kd_weight = args.rel_kd_weight
     l2sp_weight = args.l2sp_weight
     adapter_anchor_weight = args.adapter_anchor_weight
+    # Triplet loss
+    triplet_weight = args.triplet_weight
+    triplet_margin = args.triplet_margin
+    triplet_metric = args.triplet_metric
 
     print("📋 CONFIGURATION:")
     print(f"  - Submission CSV: {submission_csv}")
@@ -1439,6 +1639,9 @@ def main():
                 "rel_kd_weight": rel_kd_weight,
                 "l2sp_weight": l2sp_weight,
                 "adapter_anchor_weight": adapter_anchor_weight,
+                "triplet_weight": triplet_weight,
+                "triplet_margin": triplet_margin,
+                "triplet_metric": triplet_metric,
             }
         )
 
@@ -1509,6 +1712,9 @@ def main():
         rel_kd_weight=rel_kd_weight,
         l2sp_weight=l2sp_weight,
         adapter_anchor_weight=adapter_anchor_weight,
+        triplet_weight=triplet_weight,
+        triplet_margin=triplet_margin,
+        triplet_metric=triplet_metric,
     )
     print(f"  - Architecture: {args.arch}")
     print(f"  - Hidden dim: {hidden_dim}")
