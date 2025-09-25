@@ -128,6 +128,10 @@ class BalancedBatchSampler(Sampler):
         return domain_indices
 
     def __iter__(self):
+        # Re-shuffle each epoch for fresh sampling
+        if self.shuffle:
+            for d in self.domain_indices:
+                np.random.shuffle(self.domain_indices[d])
         k = len(self.domain_keys)
         per_dom = max(1, self.batch_size // k)  # quota per domain
         remainder = self.batch_size - per_dom * k
@@ -196,6 +200,17 @@ class SimCLRWithGRL(SimCLR):
         freeze_encoder: bool = True,
         adapter_hidden: int = 384,
         adapter_scale: float = 0.1,
+        # Progressive unfreezing + LLRD
+        unfreeze_start_epoch: int = 5,
+        unfreeze_every: int = 5,
+        max_trainable_blocks: int = 2,
+        llrd_decay: float = 0.65,
+        backbone_lr_scale: float = 0.2,
+        freeze_patch_embed: bool = True,
+        # Triplet refinements
+        triplet_use_memory: bool = False,
+        triplet_memory_size: int = 4096,
+        triplet_semi_hard: bool = True,
         **kwargs,
     ):
         # Pop custom kwargs not recognized by base SimCLR
@@ -237,6 +252,17 @@ class SimCLRWithGRL(SimCLR):
         self.triplet_weight = float(triplet_weight)
         self.triplet_margin = float(triplet_margin)
         self.triplet_metric = str(triplet_metric)
+        # Unfreezing & LLRD
+        self.unfreeze_start_epoch = int(unfreeze_start_epoch)
+        self.unfreeze_every = int(unfreeze_every)
+        self.max_trainable_blocks = int(max_trainable_blocks)
+        self.llrd_decay = float(llrd_decay)
+        self.backbone_lr_scale = float(backbone_lr_scale)
+        self.freeze_patch_embed = bool(freeze_patch_embed)
+        # Triplet refinements
+        self.triplet_use_memory = bool(triplet_use_memory)
+        self.triplet_memory_size = int(triplet_memory_size)
+        self.triplet_semi_hard = bool(triplet_semi_hard)
         if hasattr(self, "hparams"):
             try:
                 self.hparams.projector_lr = self.projector_lr
@@ -252,6 +278,17 @@ class SimCLRWithGRL(SimCLR):
                 self.hparams.triplet_weight = self.triplet_weight
                 self.hparams.triplet_margin = self.triplet_margin
                 self.hparams.triplet_metric = self.triplet_metric
+                # Unfreezing & LLRD
+                self.hparams.unfreeze_start_epoch = self.unfreeze_start_epoch
+                self.hparams.unfreeze_every = self.unfreeze_every
+                self.hparams.max_trainable_blocks = self.max_trainable_blocks
+                self.hparams.llrd_decay = self.llrd_decay
+                self.hparams.backbone_lr_scale = self.backbone_lr_scale
+                self.hparams.freeze_patch_embed = self.freeze_patch_embed
+                # Triplet memory
+                self.hparams.triplet_use_memory = self.triplet_use_memory
+                self.hparams.triplet_memory_size = self.triplet_memory_size
+                self.hparams.triplet_semi_hard = self.triplet_semi_hard
             except Exception:
                 pass
 
@@ -291,6 +328,29 @@ class SimCLRWithGRL(SimCLR):
         for p in self.domain_head.parameters():
             p.requires_grad = True
 
+        # Cache ViT structure and set initial trainable blocks
+        self._prepare_backbone_blocks()
+        self.current_trainable_blocks = (
+            0
+            if self.freeze_encoder
+            else min(self.max_trainable_blocks, self._num_vit_blocks)
+        )
+        if self.current_trainable_blocks > 0:
+            self._set_trainable_blocks(self.current_trainable_blocks)
+
+        # Triplet memory buffers (lazy init)
+        self._trip_mem_feats = None
+        self._trip_mem_labels = None
+        self._trip_mem_ptr = 0
+
+        # Extended triplet memory for NSBP constraints
+        self._trip_mem_batches = None
+        self._trip_mem_perts = None
+        # Global id maps to keep memory label ids stable across batches
+        self._trip_target_to_id = {}
+        self._trip_batch_to_id = {}
+        self._trip_pert_to_id = {}
+
         # Teacher/backbone anchor placeholders (to be initialized after loading ckpt)
         self.teacher_backbone = None
         self.backbone_init_state = None
@@ -327,14 +387,16 @@ class SimCLRWithGRL(SimCLR):
             self.log(mode + "_triplet_loss", loss, prog_bar=False)
             return loss
 
-        # Normalize and filter invalid targets
-        labels = []
-        for t in targets_list:
-            if t is None:
-                labels.append("")
-            else:
-                labels.append(str(t))
-        # No need for an indices tensor; compute directly on features
+        # Normalize target strings and gather batch/pert identifiers
+        labels = ["" if (t is None) else str(t) for t in targets_list]
+        try:
+            batches_list = [str(x) for x in metadata_collated.get("batch", [""] * B)]
+        except Exception:
+            batches_list = [""] * B
+        try:
+            perts_list = [str(x) for x in metadata_collated.get("compound", [""] * B)]
+        except Exception:
+            perts_list = [""] * B
 
         # Build mask of valid entries (non-empty targets)
         valid_mask = torch.tensor(
@@ -349,7 +411,7 @@ class SimCLRWithGRL(SimCLR):
             self.log(mode + "_triplet_loss", loss, prog_bar=False)
             return loss
 
-        # Map string labels to per-batch ids on CPU for grouping
+        # Map string labels to per-batch ids for grouping within this batch
         uniq = {}
         mapped = []
         for label_str in labels:
@@ -360,6 +422,39 @@ class SimCLRWithGRL(SimCLR):
                     uniq[label_str] = len(uniq)
                 mapped.append(uniq[label_str])
         y = torch.tensor(mapped, device=features_first_view.device, dtype=torch.long)
+
+        # Stable global ids for memory lookups
+        def _get_or_add_id(mapping: dict, key: str) -> int:
+            if key not in mapping:
+                mapping[key] = len(mapping)
+            return mapping[key]
+
+        y_global = torch.tensor(
+            [
+                _get_or_add_id(self._trip_target_to_id, s)
+                if (s.strip() != "" and s.lower() != "nan")
+                else -1
+                for s in labels
+            ],
+            device=features_first_view.device,
+            dtype=torch.long,
+        )
+        b_global = torch.tensor(
+            [
+                _get_or_add_id(self._trip_batch_to_id, s) if s.strip() != "" else -1
+                for s in batches_list
+            ],
+            device=features_first_view.device,
+            dtype=torch.long,
+        )
+        p_global = torch.tensor(
+            [
+                _get_or_add_id(self._trip_pert_to_id, s) if s.strip() != "" else -1
+                for s in perts_list
+            ],
+            device=features_first_view.device,
+            dtype=torch.long,
+        )
 
         # Restrict to valid indices where label >=0
         idx = torch.nonzero(
@@ -372,6 +467,9 @@ class SimCLRWithGRL(SimCLR):
 
         X = features_first_view[idx]
         y_idx = y[idx]
+        y_g = y_global[idx]
+        b_g = b_global[idx]
+        p_g = p_global[idx]
 
         # Need at least one class with count>=2 and at least 2 classes
         classes, counts = torch.unique(y_idx, return_counts=True)
@@ -380,48 +478,138 @@ class SimCLRWithGRL(SimCLR):
             self.log(mode + "_triplet_loss", loss, prog_bar=False)
             return loss
 
-        # Compute pairwise distances
-        if getattr(self, "triplet_metric", "cosine") == "cosine":
-            Xn = F.normalize(X, dim=1)
-            sim = torch.matmul(Xn, Xn.t())  # [M,M]
-            dist = 1.0 - sim
-            dist = dist.clamp_min(0.0)
+        # Compute normalized distances (cosine or L2 over normalized vectors)
+        metric = getattr(self, "triplet_metric", "cosine")
+        Xn = F.normalize(X, dim=1)
+        if metric == "cosine":
+            sim = torch.matmul(Xn, Xn.t())
+            dist_in = (1.0 - sim).clamp_min(0.0)
         else:
-            dist = torch.cdist(X, X, p=2)
+            dist_in = torch.cdist(Xn, Xn, p=2)
 
-        M = dist.shape[0]
-        # Build same/diff label masks
+        M = dist_in.shape[0]
+        # NSBP masks: same target, different batch and different perturbation
         y_col = y_idx.view(-1, 1)
-        same = y_col.eq(y_col.t())
-        # Exclude self from positives
-        diag = torch.eye(M, dtype=torch.bool, device=dist.device)
-        same = same & (~diag)
-        # Note: negatives are implicitly handled via ~same and min over masked distances
+        same_t = y_col.eq(y_col.t())
+        b_col = b_g.view(-1, 1)
+        p_col = p_g.view(-1, 1)
+        diff_b = b_col.ne(b_col.t())
+        diff_p = p_col.ne(p_col.t())
+        diag = torch.eye(M, dtype=torch.bool, device=dist_in.device)
+        pos_mask_in = same_t & diff_b & diff_p & (~diag)
+        neg_mask_in = (~same_t) & diff_b & diff_p & (~diag)
 
-        # For anchors with no positive or no negative, skip
-        has_pos = same.any(dim=1)
-        has_neg = (~same).any(dim=1)
-        valid_anchor = has_pos & has_neg
+        # In-batch hardest positive and negatives
+        pos_dist_in = dist_in.masked_fill(~pos_mask_in, float("-inf")).max(dim=1).values
+        neg_dists_in = dist_in.masked_fill(~neg_mask_in, float("inf"))
+
+        # Memory positives/negatives under NSBP
+        pos_dist_mem = torch.full((M,), float("-inf"), device=X.device)
+        neg_dists_mem_min = None
+        if (
+            bool(getattr(self, "triplet_use_memory", False))
+            and getattr(self, "_trip_mem_feats", None) is not None
+            and getattr(self, "_trip_mem_labels", None) is not None
+            and getattr(self, "_trip_mem_batches", None) is not None
+            and getattr(self, "_trip_mem_perts", None) is not None
+            and self._trip_mem_labels.numel() > 0
+        ):
+            mem_feats = self._trip_mem_feats.detach().clone()
+            mem_labels = self._trip_mem_labels.detach().clone()
+            mem_batches = self._trip_mem_batches.detach().clone()
+            mem_perts = self._trip_mem_perts.detach().clone()
+            if metric == "cosine":
+                dist_mem = (1.0 - (Xn @ mem_feats.t())).clamp_min(0.0)
+            else:
+                dist_mem = torch.cdist(Xn, mem_feats, p=2)
+            y_row_g = y_g.view(-1, 1)
+            b_row = b_g.view(-1, 1)
+            p_row = p_g.view(-1, 1)
+            mem_pos_mask = (
+                y_row_g.eq(mem_labels.view(1, -1))
+                & b_row.ne(mem_batches.view(1, -1))
+                & p_row.ne(mem_perts.view(1, -1))
+            )
+            mem_neg_mask = (
+                y_row_g.ne(mem_labels.view(1, -1))
+                & b_row.ne(mem_batches.view(1, -1))
+                & p_row.ne(mem_perts.view(1, -1))
+            )
+            pos_dist_mem = (
+                dist_mem.masked_fill(~mem_pos_mask, float("-inf")).max(dim=1).values
+            )
+            neg_dists_mem_min = (
+                dist_mem.masked_fill(~mem_neg_mask, float("inf")).min(dim=1).values
+            )
+
+        # Combine positives
+        pos_dist = torch.maximum(pos_dist_in, pos_dist_mem)
+
+        # Semi-hard mining: select closest negative with distance > pos_dist
+        use_semi = bool(getattr(self, "triplet_semi_hard", True))
+        if use_semi:
+            semi_mask_in = neg_dists_in > pos_dist.view(-1, 1)
+            semi_neg_in = (
+                neg_dists_in.masked_fill(~semi_mask_in, float("inf")).min(dim=1).values
+            )
+            neg_candidates = [semi_neg_in]
+            if neg_dists_mem_min is not None:
+                semi_mem = torch.where(
+                    neg_dists_mem_min > pos_dist,
+                    neg_dists_mem_min,
+                    torch.tensor(float("inf"), device=X.device),
+                )
+                neg_candidates.append(semi_mem)
+            neg_dist = torch.stack(neg_candidates, dim=0).min(dim=0).values
+            # Fallback to hardest negative if none semi-hard
+            no_semi = torch.isinf(neg_dist)
+            if no_semi.any():
+                hard_in = neg_dists_in.min(dim=1).values
+                if neg_dists_mem_min is not None:
+                    hard_overall = torch.minimum(hard_in, neg_dists_mem_min)
+                else:
+                    hard_overall = hard_in
+                neg_dist = torch.where(no_semi, hard_overall, neg_dist)
+        else:
+            hard_in = neg_dists_in.min(dim=1).values
+            if neg_dists_mem_min is not None:
+                neg_dist = torch.minimum(hard_in, neg_dists_mem_min)
+            else:
+                neg_dist = hard_in
+
+        margin = float(getattr(self, "triplet_margin", 0.2))
+        # Valid anchors: need any positive and any negative
+        has_pos_any = torch.isfinite(pos_dist)
+        has_neg_any = torch.isfinite(neg_dist)
+        valid_anchor = has_pos_any & has_neg_any
         if valid_anchor.sum().item() == 0:
             loss = torch.tensor(0.0, device=features_first_view.device)
             self.log(mode + "_triplet_loss", loss, prog_bar=False)
             return loss
-
-        # Hardest positive: max distance among positives
-        pos_dist = dist.masked_fill(~same, float("-inf")).max(dim=1).values
-        # Hardest negative: min distance among negatives (exclude positives and self)
-        neg_mask = (~same) & (~diag)
-        neg_dist = dist.masked_fill(~neg_mask, float("inf")).min(dim=1).values
-
-        margin = float(getattr(self, "triplet_margin", 0.2))
         triplet = F.relu(pos_dist - neg_dist + margin)
         triplet = triplet[valid_anchor]
-        if triplet.numel() == 0:
-            loss = torch.tensor(0.0, device=features_first_view.device)
-            self.log(mode + "_triplet_loss", loss, prog_bar=False)
-            return loss
         loss = triplet.mean()
+        # Mining health logs
+        try:
+            active_rate = valid_anchor.float().mean()
+            self.log(
+                mode + "_triplet_active_pairs", active_rate, prog_bar=(mode == "train")
+            )
+            pos_per_anchor = pos_mask_in.float().sum(dim=1).mean()
+            self.log(
+                mode + "_triplet_pos_per_anchor_inbatch", pos_per_anchor, prog_bar=False
+            )
+        except Exception:
+            pass
         self.log(mode + "_triplet_loss", loss, prog_bar=(mode == "train"))
+        # Update memory with normalized feats and global ids
+        if mode == "train" and bool(getattr(self, "triplet_use_memory", False)):
+            try:
+                self._update_triplet_memory(
+                    Xn.detach(), y_g.detach(), b_g.detach(), p_g.detach()
+                )
+            except Exception:
+                pass
         return loss
 
     def initialize_teacher(self):
@@ -442,6 +630,223 @@ class SimCLRWithGRL(SimCLR):
             print("🧊 Initialized frozen teacher backbone and L2-SP anchors")
         except Exception as e:
             print(f"⚠️  Failed to initialize teacher/backbone anchors: {e}")
+
+    # ---------------- Backbone unfreezing and LLRD helpers ----------------
+    def _prepare_backbone_blocks(self):
+        self._vit_blocks = []
+        self._num_vit_blocks = 0
+        self._patch_embed = getattr(self.backbone, "patch_embed", None)
+        self._pos_embed = getattr(self.backbone, "pos_embed", None)
+        self._cls_token = getattr(self.backbone, "cls_token", None)
+        self._final_norm = getattr(self.backbone, "norm", None)
+        if hasattr(self.backbone, "blocks") and isinstance(
+            self.backbone.blocks, nn.ModuleList
+        ):
+            self._vit_blocks = list(self.backbone.blocks)
+            self._num_vit_blocks = len(self._vit_blocks)
+
+    def _set_trainable_blocks(self, num_trainable_blocks: int):
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        if not self.freeze_patch_embed:
+            for mod in [self._patch_embed, self._pos_embed, self._cls_token]:
+                if mod is None:
+                    continue
+                if isinstance(mod, nn.Parameter):
+                    mod.requires_grad = True
+                else:
+                    for p in getattr(mod, "parameters", lambda: [])():
+                        p.requires_grad = True
+        k = max(0, min(int(num_trainable_blocks), self._num_vit_blocks))
+        if k > 0:
+            for blk in self._vit_blocks[-k:]:
+                for p in blk.parameters():
+                    p.requires_grad = True
+        if k > 0 and self._final_norm is not None:
+            for p in self._final_norm.parameters():
+                p.requires_grad = True
+        self.current_trainable_blocks = k
+
+    def _build_backbone_llrd_param_groups(
+        self, base_lr: float, decay: float, wd: float
+    ):
+        param_groups = []
+
+        def is_no_decay(n: str, p: torch.nn.Parameter):
+            if p.ndim == 1:
+                return True
+            if "bias" in n:
+                return True
+            if "pos_embed" in n or "cls_token" in n:
+                return True
+            return False
+
+        num_blocks = getattr(self, "_num_vit_blocks", 0)
+        vit_blocks = getattr(self, "_vit_blocks", [])
+        for i, blk in enumerate(vit_blocks):
+            lr_scale = decay ** (num_blocks - 1 - i if num_blocks > 0 else 0)
+            decay_params, no_decay_params = [], []
+            for n, p in blk.named_parameters():
+                (no_decay_params if is_no_decay(n, p) else decay_params).append(p)
+            if decay_params:
+                param_groups.append(
+                    {
+                        "name": f"backbone_block_{i}_decay",
+                        "params": decay_params,
+                        "lr": base_lr * lr_scale,
+                        "weight_decay": wd,
+                    }
+                )
+            if no_decay_params:
+                param_groups.append(
+                    {
+                        "name": f"backbone_block_{i}_no_decay",
+                        "params": no_decay_params,
+                        "lr": base_lr * lr_scale,
+                        "weight_decay": 0.0,
+                    }
+                )
+        tail_lr = base_lr * (decay ** max(1, num_blocks)) if num_blocks > 0 else base_lr
+        special_modules = []
+        if getattr(self, "_patch_embed", None) is not None:
+            special_modules.append(("patch_embed", self._patch_embed))
+        if isinstance(getattr(self, "_pos_embed", None), torch.nn.Parameter):
+            special_modules.append(("pos_embed", self._pos_embed))
+        if isinstance(getattr(self, "_cls_token", None), torch.nn.Parameter):
+            special_modules.append(("cls_token", self._cls_token))
+        if getattr(self, "_final_norm", None) is not None:
+            special_modules.append(("final_norm", self._final_norm))
+        for name, mod in special_modules:
+            decay_params, no_decay_params = [], []
+            if isinstance(mod, torch.nn.Parameter):
+                no_decay_params.append(mod)
+            else:
+                for n, p in mod.named_parameters(recurse=True):
+                    (no_decay_params if is_no_decay(n, p) else decay_params).append(p)
+            if decay_params:
+                param_groups.append(
+                    {
+                        "name": f"backbone_{name}_decay",
+                        "params": decay_params,
+                        "lr": tail_lr,
+                        "weight_decay": wd,
+                    }
+                )
+            if no_decay_params:
+                param_groups.append(
+                    {
+                        "name": f"backbone_{name}_no_decay",
+                        "params": no_decay_params,
+                        "lr": tail_lr,
+                        "weight_decay": 0.0,
+                    }
+                )
+        return param_groups
+
+    def on_train_epoch_start(self):
+        try:
+            epoch = int(self.current_epoch)
+            start = int(
+                getattr(
+                    self.hparams,
+                    "unfreeze_start_epoch",
+                    getattr(self, "unfreeze_start_epoch", 5),
+                )
+            )
+            every = int(
+                getattr(
+                    self.hparams, "unfreeze_every", getattr(self, "unfreeze_every", 5)
+                )
+            )
+            max_k = int(
+                getattr(
+                    self.hparams,
+                    "max_trainable_blocks",
+                    getattr(self, "max_trainable_blocks", 2),
+                )
+            )
+            if epoch < start:
+                desired = 0
+            else:
+                steps = 1 + (epoch - start) // max(1, every)
+                desired = max(0, min(steps, max_k))
+            if desired != getattr(self, "current_trainable_blocks", 0):
+                self._set_trainable_blocks(desired)
+                self.log(
+                    "train_unfrozen_blocks",
+                    float(self.current_trainable_blocks),
+                    prog_bar=True,
+                )
+                print(
+                    f"  🔓 Unfreezing: last {self.current_trainable_blocks} ViT blocks trainable"
+                )
+        except Exception as e:
+            print(f"⚠️  Unfreezing schedule failed: {e}")
+
+    # ---------------- Triplet memory helpers ----------------
+    def _init_triplet_memory(self, feature_dim: int):
+        device = self.device
+        N = int(
+            getattr(
+                self.hparams,
+                "triplet_memory_size",
+                getattr(self, "triplet_memory_size", 4096),
+            )
+        )
+        self._trip_mem_feats = torch.zeros(N, feature_dim, device=device)
+        self._trip_mem_labels = torch.full((N,), -1, device=device, dtype=torch.long)
+        self._trip_mem_batches = torch.full((N,), -1, device=device, dtype=torch.long)
+        self._trip_mem_perts = torch.full((N,), -1, device=device, dtype=torch.long)
+        self._trip_mem_ptr = 0
+
+    def _update_triplet_memory(
+        self,
+        feats_norm: torch.Tensor,
+        target_ids: torch.Tensor,
+        batch_ids: torch.Tensor,
+        pert_ids: torch.Tensor,
+    ):
+        if not bool(getattr(self, "triplet_use_memory", False)):
+            return
+        if (
+            feats_norm is None
+            or target_ids is None
+            or batch_ids is None
+            or pert_ids is None
+        ):
+            return
+        if getattr(self, "_trip_mem_feats", None) is None:
+            self._init_triplet_memory(feats_norm.shape[1])
+        mask = (target_ids >= 0) & (batch_ids >= 0) & (pert_ids >= 0)
+        if mask.sum() == 0:
+            return
+        feats = feats_norm[mask]
+        labs = target_ids[mask]
+        b_ids = batch_ids[mask]
+        p_ids = pert_ids[mask]
+        N = self._trip_mem_feats.shape[0]
+        m = feats.shape[0]
+        if m == 0:
+            return
+        end = self._trip_mem_ptr + m
+        if end <= N:
+            self._trip_mem_feats[self._trip_mem_ptr : end] = feats
+            self._trip_mem_labels[self._trip_mem_ptr : end] = labs
+            self._trip_mem_batches[self._trip_mem_ptr : end] = b_ids
+            self._trip_mem_perts[self._trip_mem_ptr : end] = p_ids
+        else:
+            first = N - self._trip_mem_ptr
+            if first > 0:
+                self._trip_mem_feats[self._trip_mem_ptr : N] = feats[:first]
+                self._trip_mem_labels[self._trip_mem_ptr : N] = labs[:first]
+                self._trip_mem_batches[self._trip_mem_ptr : N] = b_ids[:first]
+                self._trip_mem_perts[self._trip_mem_ptr : N] = p_ids[:first]
+            rem = m - first
+            self._trip_mem_feats[0:rem] = feats[first:]
+            self._trip_mem_labels[0:rem] = labs[first:]
+            self._trip_mem_batches[0:rem] = b_ids[first:]
+            self._trip_mem_perts[0:rem] = p_ids[first:]
+        self._trip_mem_ptr = (self._trip_mem_ptr + m) % N
 
     def configure_optimizers(self):
         # Parameter groups with different learning rates
@@ -469,6 +874,22 @@ class SimCLRWithGRL(SimCLR):
         )
         head_lr = projector_lr * head_lr_scale
 
+        # Add backbone groups with LLRD
+        backbone_groups = self._build_backbone_llrd_param_groups(
+            base_lr=projector_lr
+            * float(
+                getattr(
+                    self.hparams,
+                    "backbone_lr_scale",
+                    getattr(self, "backbone_lr_scale", 0.2),
+                )
+            ),
+            decay=float(
+                getattr(self.hparams, "llrd_decay", getattr(self, "llrd_decay", 0.65))
+            ),
+            wd=self.hparams.weight_decay,
+        )
+
         optimizer = torch.optim.AdamW(
             [
                 {
@@ -490,6 +911,7 @@ class SimCLRWithGRL(SimCLR):
                     "weight_decay": self.hparams.weight_decay,
                 },
             ]
+            + backbone_groups
         )
         lr_scheduler = self._get_lr_scheduler(optimizer)
         # Step LR every training step to ensure warmup works within first epoch
@@ -652,10 +1074,13 @@ class SimCLRWithGRL(SimCLR):
                         self.log(f"{mode}_domain_{i}_count", count, prog_bar=False)
 
                     # Log domain balance metric (entropy of distribution)
-                    if count > 0:
-                        probs = domain_dist / domain_dist.sum()
+                    total = domain_dist.sum()
+                    if total > 0:
+                        probs = domain_dist / total
                         entropy = -np.sum(probs * np.log(probs + 1e-8))
-                        self.log(f"{mode}_domain_entropy", entropy, prog_bar=False)
+                        self.log(
+                            f"{mode}_domain_entropy", float(entropy), prog_bar=False
+                        )
 
         return loss
 
@@ -812,7 +1237,7 @@ class SimCLRWithGRL(SimCLR):
         # Log detailed progress every 10 batches
         if batch_idx % 10 == 0:
             print(
-                f"    [LOSSES] SimCLR: {simclr_loss:.4f}, Domain: {domain_loss:.4f}, Total: {total_loss:.4f}"
+                f"    [LOSSES] SimCLR: {simclr_loss:.4f}, Weighted Triplet: {self.triplet_weight * triplet_loss:.4f}, Weighted Domain: {self.domain_loss_weight * domain_loss:.4f}, Total: {total_loss:.4f}"
             )
             print(f"    [GRL] Current Lambda: {self.grl.lambd:.3f}")
 
@@ -834,7 +1259,7 @@ class SimCLRWithGRL(SimCLR):
         _ = self._domain_loss_and_metrics(adapted, domain_targets, mode="val")
         # Triplet loss on first-view embeddings only (for logging)
         try:
-            Bfirst = imgs.shape[0]
+            Bfirst = imgs.shape[0] // 2
             first_view_adapted = adapted[:Bfirst]
             triplet_loss_val = self._batch_hard_triplet_loss(
                 first_view_adapted, metadata_collated, mode="val"
@@ -1077,61 +1502,89 @@ class SimCLRWithGRL(SimCLR):
             except Exception as e:
                 print(f"⚠️  Perturbation mAP eval failed: {e}")
 
-            # Target odds ratio / p-value at top 5% similarity (mini-eval)
+            # Target NSBP metrics: OR@5, hit rate@5, eligible rate
             try:
                 if "target" in df.columns and df["target"].notnull().any():
-                    if df["target"].nunique(dropna=True) >= 2 and len(df) >= 30:
-                        # Standardize features
-                        X = StandardScaler().fit_transform(df[feature_cols].to_numpy())
-                        labels = LabelEncoder().fit_transform(
-                            df["target"].astype(str).values
+                    targets_arr = df["target"].astype(str).values
+                    batches_arr = (
+                        df["batch"].astype(str).values
+                        if "batch" in df.columns
+                        else None
+                    )
+                    perts_arr = (
+                        df["perturbation_id"].astype(str).values
+                        if "perturbation_id" in df.columns
+                        else None
+                    )
+                    if batches_arr is None or perts_arr is None:
+                        print(
+                            "⚠️  mini-eval: missing batch or perturbation_id for NSBP; skipping"
                         )
-                        # Cosine distance → similarity
-                        dist_mat = evl.pairwise_distances_parallel(X, metric="cosine")
-                        np.fill_diagonal(dist_mat, np.nan)
-                        sim = 1.0 - dist_mat
-                        n = sim.shape[0]
-                        iu, ju = np.triu_indices(n, k=1)
-                        sim_vals = sim[iu, ju]
-                        thresh = np.nanpercentile(sim_vals, 95.0)
-                        high = sim_vals >= thresh
-                        same = labels[iu] == labels[ju]
-                        a = int(np.nansum(np.logical_and(high, same)))
-                        c = int(np.nansum(np.logical_and(high, ~same)))
-                        b = int(np.nansum(np.logical_and(~high, same)))
-                        d = int(np.nansum(np.logical_and(~high, ~same)))
-                        aa, bb, cc, dd = a, b, c, d
+                    else:
+                        # Normalize features and compute similarities on the fly
+                        E = df[feature_cols].to_numpy().astype(np.float32)
+                        # row-normalize
+                        norms = np.linalg.norm(E, axis=1, keepdims=True) + 1e-12
+                        En = E / norms
+                        K = 5
+                        a_tot = 0
+                        b_tot = 0
+                        c_tot = 0
+                        d_tot = 0
+                        eligible_k = 0
+                        hits = 0
+                        N = En.shape[0]
+                        for i in range(N):
+                            cand = (batches_arr != batches_arr[i]) & (
+                                perts_arr != perts_arr[i]
+                            )
+                            cand[i] = False
+                            idxs = np.where(cand)[0]
+                            if idxs.size == 0:
+                                continue
+                            # cosine similarities to candidates
+                            sims = En[idxs] @ En[i]
+                            topk = min(K, idxs.size)
+                            if topk == 0:
+                                continue
+                            # eligibility: at least one NSBP same-target exists in pool
+                            same_cand = targets_arr[idxs] == targets_arr[i]
+                            same_total = int(np.sum(same_cand))
+                            if same_total > 0:
+                                eligible_k += 1
+                            # select topK indices
+                            part = np.argpartition(sims, -topk)[-topk:]
+                            top_idx = idxs[part]
+                            # count positives among candidates and among topK
+                            same_top = targets_arr[top_idx] == targets_arr[i]
+                            a_i = int(np.sum(same_top))
+                            c_i = topk - a_i
+                            b_i = max(0, same_total - a_i)
+                            d_i = max(0, int(idxs.size) - topk - b_i)
+                            a_tot += a_i
+                            b_tot += b_i
+                            c_tot += c_i
+                            d_tot += d_i
+                            if same_total > 0 and a_i > 0:
+                                hits += 1
+                        # Compute pooled OR with Haldane-Anscombe correction
+                        aa, bb, cc, dd = a_tot, b_tot, c_tot, d_tot
                         if min(aa, bb, cc, dd) == 0:
                             aa += 0.5
                             bb += 0.5
                             cc += 0.5
                             dd += 0.5
-                        odds_ratio = (aa / bb) / (cc / dd)
-
-                        # Hypergeometric p-value (single table) in log-space
-                        def _logcomb(n, k):
-                            return (
-                                math.lgamma(n + 1)
-                                - math.lgamma(k + 1)
-                                - math.lgamma(n - k + 1)
-                            )
-
-                        logp = (
-                            _logcomb(a + b, a)
-                            + _logcomb(c + d, c)
-                            - _logcomb(a + b + c + d, a + c)
-                        )
-                        p_value = float(np.exp(logp))
-                        self.log("val_target_odds_ratio_top5", float(odds_ratio))
-                        self.log("val_target_p_value_top5", float(p_value))
-                    else:
-                        print(
-                            "⚠️  mini-eval: insufficient target diversity/samples for OR/p-value"
-                        )
+                        or_at5 = (aa / bb) / (cc / dd)
+                        total_queries = N
+                        eligible_rate = eligible_k / max(1, total_queries)
+                        hit_rate = hits / max(1, eligible_k)
+                        self.log("val_target_OR_at5_NSBP", float(or_at5))
+                        self.log("val_target_at5_NSBP", float(hit_rate))
+                        self.log("val_target_eligible_rate_NSBP", float(eligible_rate))
                 else:
-                    print("⚠️  mini-eval: 'target' column missing for OR/p-value")
+                    print("⚠️  mini-eval: 'target' column missing for NSBP metrics")
             except Exception as e:
-                print(f"⚠️  Target OR/p-value eval failed: {e}")
+                print(f"⚠️  Target NSBP metrics eval failed: {e}")
 
             # Early-stop checkpointing using target accuracy (NSP, NSBP) as primary criteria
             try:
@@ -1284,7 +1737,7 @@ def main():
     parser.add_argument(
         "--adv_lambda",
         type=float,
-        default=1.0,
+        default=0.2,
         help="Weight for adversarial domain CE loss",
     )
     parser.add_argument(
@@ -1329,13 +1782,13 @@ def main():
     parser.add_argument(
         "--head_lr_scale",
         type=float,
-        default=0.5,
-        help="Domain head LR as a scale of projector_lr (e.g., 0.5 means head is 0.5x)",
+        default=1.5,
+        help="Domain head LR as a scale of projector_lr (e.g., 1.5 means head is 1.5x)",
     )
     parser.add_argument(
         "--head_update_every",
         type=int,
-        default=2,
+        default=1,
         help="Update the domain head every N steps (set 1 to disable)",
     )
     # Data parameters
@@ -1430,13 +1883,13 @@ def main():
     parser.add_argument(
         "--triplet_weight",
         type=float,
-        default=0.0,
+        default=0.5,
         help="Weight for batch-hard triplet loss (0 disables)",
     )
     parser.add_argument(
         "--triplet_margin",
         type=float,
-        default=0.2,
+        default=0.1,
         help="Margin for triplet loss",
     )
     parser.add_argument(
@@ -1445,6 +1898,59 @@ def main():
         default="cosine",
         choices=["cosine", "euclidean"],
         help="Distance metric for triplet loss",
+    )
+    # Progressive unfreezing & LLRD
+    parser.add_argument(
+        "--unfreeze_start_epoch",
+        type=int,
+        default=5,
+        help="Epoch to begin unfreezing ViT blocks",
+    )
+    parser.add_argument(
+        "--unfreeze_every",
+        type=int,
+        default=5,
+        help="Unfreeze +1 block every N epochs after start",
+    )
+    parser.add_argument(
+        "--max_trainable_blocks",
+        type=int,
+        default=2,
+        help="Maximum number of last ViT blocks to unfreeze",
+    )
+    parser.add_argument(
+        "--llrd_decay",
+        type=float,
+        default=0.65,
+        help="Layer-wise LR decay factor (0<d<1)",
+    )
+    parser.add_argument(
+        "--backbone_lr_scale",
+        type=float,
+        default=0.2,
+        help="Backbone base LR = projector_lr * scale",
+    )
+    parser.add_argument(
+        "--no_freeze_patch_embed",
+        action="store_true",
+        help="Allow patch/embed tokens to train when unfreezing",
+    )
+    # Triplet refinements
+    parser.add_argument(
+        "--triplet_use_memory",
+        action="store_true",
+        help="Enable cross-batch memory for negatives",
+    )
+    parser.add_argument(
+        "--triplet_memory_size",
+        type=int,
+        default=16384,
+        help="Size of cross-batch memory queue",
+    )
+    parser.add_argument(
+        "--no_triplet_semi_hard",
+        action="store_true",
+        help="Disable semi-hard mining (use hardest)",
     )
 
     args = parser.parse_args()
@@ -1492,6 +1998,17 @@ def main():
     triplet_weight = args.triplet_weight
     triplet_margin = args.triplet_margin
     triplet_metric = args.triplet_metric
+    # Progressive unfreezing & LLRD
+    unfreeze_start_epoch = args.unfreeze_start_epoch
+    unfreeze_every = args.unfreeze_every
+    max_trainable_blocks = args.max_trainable_blocks
+    llrd_decay = args.llrd_decay
+    backbone_lr_scale = args.backbone_lr_scale
+    freeze_patch_embed = not args.no_freeze_patch_embed
+    # Triplet refinements
+    triplet_use_memory = args.triplet_use_memory
+    triplet_memory_size = args.triplet_memory_size
+    triplet_semi_hard = not args.no_triplet_semi_hard
 
     print("📋 CONFIGURATION:")
     print(f"  - Submission CSV: {submission_csv}")
@@ -1621,7 +2138,7 @@ def main():
                 "temperature": temperature,
                 "adv_lambda": adv_lambda,
                 "lambda_delay_frac": args.lambda_delay_frac,
-                "domain_loss_wight": domain_loss_weight,
+                "domain_loss_weight": domain_loss_weight,
                 "domain_hidden": domain_hidden,
                 "domain_head_dropout": args.domain_head_dropout,
                 "freeze_encoder": freeze_encoder,
@@ -1642,6 +2159,17 @@ def main():
                 "triplet_weight": triplet_weight,
                 "triplet_margin": triplet_margin,
                 "triplet_metric": triplet_metric,
+                # progressive unfreezing & LLRD
+                "unfreeze_start_epoch": unfreeze_start_epoch,
+                "unfreeze_every": unfreeze_every,
+                "max_trainable_blocks": max_trainable_blocks,
+                "llrd_decay": llrd_decay,
+                "backbone_lr_scale": backbone_lr_scale,
+                "freeze_patch_embed": freeze_patch_embed,
+                # triplet refinements
+                "triplet_use_memory": triplet_use_memory,
+                "triplet_memory_size": triplet_memory_size,
+                "triplet_semi_hard": triplet_semi_hard,
             }
         )
 
@@ -1715,6 +2243,17 @@ def main():
         triplet_weight=triplet_weight,
         triplet_margin=triplet_margin,
         triplet_metric=triplet_metric,
+        # unfreezing & LLRD
+        unfreeze_start_epoch=unfreeze_start_epoch,
+        unfreeze_every=unfreeze_every,
+        max_trainable_blocks=max_trainable_blocks,
+        llrd_decay=llrd_decay,
+        backbone_lr_scale=backbone_lr_scale,
+        freeze_patch_embed=freeze_patch_embed,
+        # triplet refinements
+        triplet_use_memory=triplet_use_memory,
+        triplet_memory_size=triplet_memory_size,
+        triplet_semi_hard=triplet_semi_hard,
     )
     print(f"  - Architecture: {args.arch}")
     print(f"  - Hidden dim: {hidden_dim}")
@@ -2034,6 +2573,72 @@ def main():
                         baseline_metrics["baseline_target_p_value_top5"] = float(
                             p_value
                         )
+            except Exception:
+                pass
+
+            # Baseline NSBP metrics: OR@5, hit rate@5, eligible rate
+            try:
+                if (
+                    "target" in df.columns
+                    and df["target"].notnull().any()
+                    and "batch" in df.columns
+                    and "perturbation_id" in df.columns
+                ):
+                    targets_arr = df["target"].astype(str).values
+                    batches_arr = df["batch"].astype(str).values
+                    perts_arr = df["perturbation_id"].astype(str).values
+                    E = df[feature_cols].to_numpy().astype(np.float32)
+                    norms = np.linalg.norm(E, axis=1, keepdims=True) + 1e-12
+                    En = E / norms
+                    K = 5
+                    a_tot = b_tot = c_tot = d_tot = 0
+                    eligible_k = 0
+                    hits = 0
+                    N = En.shape[0]
+                    for i in range(N):
+                        cand = (batches_arr != batches_arr[i]) & (
+                            perts_arr != perts_arr[i]
+                        )
+                        cand[i] = False
+                        idxs = np.where(cand)[0]
+                        if idxs.size == 0:
+                            continue
+                        sims = En[idxs] @ En[i]
+                        topk = min(K, idxs.size)
+                        if topk == 0:
+                            continue
+                        if idxs.size >= K:
+                            eligible_k += 1
+                        part = np.argpartition(sims, -topk)[-topk:]
+                        top_idx = idxs[part]
+                        same_cand = targets_arr[idxs] == targets_arr[i]
+                        same_top = targets_arr[top_idx] == targets_arr[i]
+                        a_i = int(np.sum(same_top))
+                        c_i = topk - a_i
+                        same_total = int(np.sum(same_cand))
+                        b_i = max(0, same_total - a_i)
+                        d_i = max(0, int(idxs.size) - topk - b_i)
+                        a_tot += a_i
+                        b_tot += b_i
+                        c_tot += c_i
+                        d_tot += d_i
+                        if a_i > 0:
+                            hits += 1
+                    aa, bb, cc, dd = a_tot, b_tot, c_tot, d_tot
+                    if min(aa, bb, cc, dd) == 0:
+                        aa += 0.5
+                        bb += 0.5
+                        cc += 0.5
+                        dd += 0.5
+                    or_at5 = (aa / bb) / (cc / dd)
+                    total_queries = N
+                    eligible_rate = eligible_k / max(1, total_queries)
+                    hit_rate = hits / max(1, eligible_k)
+                    baseline_metrics["baseline_target_OR_at5_NSBP"] = float(or_at5)
+                    baseline_metrics["baseline_target_at5_NSBP"] = float(hit_rate)
+                    baseline_metrics["baseline_target_eligible_rate_NSBP"] = float(
+                        eligible_rate
+                    )
             except Exception:
                 pass
 
