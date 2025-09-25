@@ -237,6 +237,25 @@ def main():
         ],
     )
     parser.add_argument("--l2norm", action="store_true")
+    # Batch-leakage feature filtering
+    parser.add_argument(
+        "--drop_batch_fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of most batch-predictive embedding features to drop (0-1).",
+    )
+    parser.add_argument(
+        "--drop_batch_cv",
+        type=int,
+        default=3,
+        help="K folds for cross-validated logistic regression per feature.",
+    )
+    parser.add_argument(
+        "--drop_batch_max_features",
+        type=int,
+        default=None,
+        help="Optional hard cap on number of features to drop (after fraction).",
+    )
 
     args = parser.parse_args()
 
@@ -275,6 +294,77 @@ def main():
     print(f"Saving raw to {out_csv}")
     df = save_well_features(well_embs, well_meta, out_csv)
     print(f"✅ Saved {len(df)} wells with embedding dim {len(well_embs[0])}")
+
+    # Optional: identify and drop batch-predictive features via per-feature logistic regression
+    if args.drop_batch_fraction and args.drop_batch_fraction > 0.0:
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.model_selection import StratifiedKFold, cross_val_score
+            import numpy as np
+            import pandas as pd
+
+            emb_cols = [c for c in df.columns if c.startswith("emb")]
+            if len(emb_cols) == 0:
+                print("No embedding columns found for feature dropping; skipping.")
+            else:
+                print(
+                    f"Scoring {len(emb_cols)} features by batch predictability (CV={args.drop_batch_cv})"
+                )
+                X = df[emb_cols].to_numpy()
+                y = df["batch"].astype(str).values
+                # Use liblinear for small dimensional single-feature fits; multinomial auto-handled
+                lr = LogisticRegression(max_iter=200, solver="liblinear")
+                cv = StratifiedKFold(
+                    n_splits=max(2, args.drop_batch_cv), shuffle=True, random_state=42
+                )
+                scores = []
+                for j, col in enumerate(emb_cols):
+                    xj = X[:, j].reshape(-1, 1)
+                    try:
+                        acc = cross_val_score(
+                            lr, xj, y, cv=cv, scoring="accuracy"
+                        ).mean()
+                    except Exception:
+                        acc = 0.0
+                    scores.append(acc)
+                scores = np.array(scores)
+                # Rank descending by accuracy
+                order = np.argsort(-scores)
+                n_drop_by_frac = int(
+                    np.floor(len(emb_cols) * float(args.drop_batch_fraction))
+                )
+                n_drop = n_drop_by_frac
+                if args.drop_batch_max_features is not None:
+                    n_drop = min(n_drop, int(args.drop_batch_max_features))
+                n_drop = max(0, min(n_drop, len(emb_cols)))
+                drop_idx = order[:n_drop]
+                drop_cols = [emb_cols[i] for i in drop_idx]
+                keep_cols = [c for c in emb_cols if c not in drop_cols]
+                print(
+                    f"Dropping {len(drop_cols)}/{len(emb_cols)} features (~{100.0 * len(drop_cols) / max(1, len(emb_cols)):.1f}%)"
+                )
+                # Save a report
+                rep = pd.DataFrame(
+                    {
+                        "feature": emb_cols,
+                        "cv_accuracy": scores,
+                        "rank": (-scores).argsort().argsort() + 1,
+                        "dropped": [c in drop_cols for c in emb_cols],
+                    }
+                ).sort_values("cv_accuracy", ascending=False)
+                rep_path = os.path.join(args.output_dir, "batch_feature_scores.csv")
+                rep.to_csv(rep_path, index=False)
+                print(f"Saved batch feature scores to {rep_path}")
+                # Apply mask to raw df for downstream postprocessing
+                df = pd.concat(
+                    [
+                        df[[c for c in df.columns if not c.startswith("emb")]],
+                        df[keep_cols],
+                    ],
+                    axis=1,
+                )
+        except Exception as e:
+            print(f"Warning: batch-predictive feature dropping failed: {e}")
 
     # Post-process and save normalized well and aggregate features
     print(f"Postprocessing embeddings method: {args.norm_method}")
