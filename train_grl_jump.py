@@ -1417,9 +1417,6 @@ class SimCLRWithGRL(SimCLR):
                     )
                 )
                 if frac > 0.0 and len(rows) >= 20:
-                    import numpy as np
-                    import pandas as pd
-
                     try:
                         import xgboost as xgb
                     except Exception as e:
