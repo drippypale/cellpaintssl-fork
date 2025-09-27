@@ -23,6 +23,9 @@ from source.inference_utils import post_proc
 from source.mae.load_mae import load_pretrained_mae
 from source.dino.utils import load_pretrained_dino
 import source.dino.vision_transformer as vits
+import warnings
+
+warnings.filterwarnings("ignore")
 
 
 def build_embedder(model_name: str, arch: str, ckpt: str):
@@ -237,6 +240,25 @@ def main():
         ],
     )
     parser.add_argument("--l2norm", action="store_true")
+    # XGBoost-based batch importance & masking
+    parser.add_argument(
+        "--xgb_batch_mask_fraction",
+        type=float,
+        default=0.0,
+        help="If >0, train XGBoost to predict batch on well embeddings, drop top fraction of most important features.",
+    )
+    parser.add_argument(
+        "--xgb_top_k_plot",
+        type=int,
+        default=40,
+        help="Top-K features to plot in importance barplot.",
+    )
+    parser.add_argument(
+        "--xgb_random_state",
+        type=int,
+        default=42,
+        help="Random state for XGBoost training.",
+    )
     # Batch-leakage feature filtering
     parser.add_argument(
         "--drop_batch_fraction",
@@ -368,6 +390,114 @@ def main():
 
     # Post-process and save normalized well and aggregate features
     print(f"Postprocessing embeddings method: {args.norm_method}")
+
+    # Optional: XGBoost-based batch importance scoring and masking
+    if args.xgb_batch_mask_fraction and args.xgb_batch_mask_fraction > 0.0:
+        try:
+            try:
+                import xgboost as xgb
+            except Exception as e:
+                raise RuntimeError(
+                    f"xgboost not available. Please install it to use --xgb_batch_mask_fraction. Error: {e}"
+                )
+
+            import matplotlib.pyplot as plt
+            import numpy as np
+            import pandas as pd
+            from sklearn.preprocessing import LabelEncoder
+
+            emb_cols = [c for c in df.columns if c.startswith("emb")]
+            if len(emb_cols) == 0:
+                print("No embedding columns found for XGBoost masking; skipping.")
+            else:
+                X = df[emb_cols].to_numpy()
+                y_raw = df["batch"].astype(str).fillna("unknown").values
+                # Guard: need at least two batches to train a classifier
+                if np.unique(y_raw).size < 2:
+                    print(
+                        "XGBoost masking skipped: only one unique batch label present."
+                    )
+                    raise SystemExit(0)
+                le = LabelEncoder()
+                y = le.fit_transform(y_raw)
+
+                clf = xgb.XGBClassifier(
+                    n_estimators=400,
+                    max_depth=5,
+                    learning_rate=0.05,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    objective="multi:softprob",
+                    eval_metric="mlogloss",
+                    random_state=int(args.xgb_random_state),
+                    n_jobs=4,
+                )
+                clf.fit(X, y)
+
+                # Get importance (gain preferred; fallback to weight)
+                booster = clf.get_booster()
+                try:
+                    score_dict = booster.get_score(importance_type="gain")
+                except Exception:
+                    score_dict = booster.get_score(importance_type="weight")
+
+                # Map xgb feature names (f0,f1,...) back to emb_cols
+                importances = np.zeros(len(emb_cols), dtype=float)
+                for k, v in score_dict.items():
+                    try:
+                        idx = int(k[1:])  # 'f123' -> 123
+                        if 0 <= idx < len(importances):
+                            importances[idx] = float(v)
+                    except Exception:
+                        continue
+
+                # Save importance CSV
+                imp_df = pd.DataFrame(
+                    {
+                        "feature": emb_cols,
+                        "importance": importances,
+                    }
+                ).sort_values("importance", ascending=False)
+                imp_csv = os.path.join(
+                    args.output_dir, "xgb_batch_feature_importance.csv"
+                )
+                imp_df.to_csv(imp_csv, index=False)
+                print(f"Saved XGBoost feature importances to {imp_csv}")
+
+                # Plot top-k importances
+                top_k = int(max(1, args.xgb_top_k_plot))
+                imp_top = imp_df.head(top_k)
+                plt.figure(figsize=(8, max(4, int(0.25 * top_k))))
+                plt.barh(imp_top["feature"][::-1], imp_top["importance"][::-1])
+                plt.xlabel("XGBoost importance (gain)")
+                plt.ylabel("Feature")
+                plt.title("Top XGBoost feature importances for batch prediction")
+                plt.tight_layout()
+                plot_path = os.path.join(
+                    args.output_dir, "xgb_batch_feature_importance_topk.png"
+                )
+                plt.savefig(plot_path, dpi=150)
+                plt.close()
+                print(f"Saved importance plot to {plot_path}")
+
+                # Mask top fraction of features
+                frac = float(args.xgb_batch_mask_fraction)
+                n_drop = int(np.floor(len(emb_cols) * frac))
+                n_drop = max(0, min(n_drop, len(emb_cols)))
+                drop_cols = imp_df.head(n_drop)["feature"].tolist()
+                keep_cols = [c for c in emb_cols if c not in drop_cols]
+                print(
+                    f"XGB-masking: dropping {len(drop_cols)}/{len(emb_cols)} features (~{100.0 * len(drop_cols) / max(1, len(emb_cols)):.1f}%)"
+                )
+                df = pd.concat(
+                    [
+                        df[[c for c in df.columns if not c.startswith("emb")]],
+                        df[keep_cols],
+                    ],
+                    axis=1,
+                )
+        except Exception as e:
+            print(f"Warning: XGBoost-based masking failed: {e}")
     embeddings_proc_well, embeddings_proc_agg = post_proc(
         df,
         df,

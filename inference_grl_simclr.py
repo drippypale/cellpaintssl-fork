@@ -28,24 +28,27 @@ class GRLSimCLREmbeddingNet(torch.nn.Module):
     Only uses backbone + projector, ignores domain head and GRL.
     """
 
-    def __init__(self, grl_model):
+    def __init__(self, grl_model, use_adapter: bool = False):
         super().__init__()
         self.backbone = grl_model.backbone
         # Adapter-related modules from GRL model (may not exist on old ckpts)
         self.adapter = getattr(grl_model, "adapter", None)
         self.adapter_scale = float(getattr(grl_model, "adapter_scale", 0.0))
         self.mlp = getattr(grl_model, "mlp", None)
+        self.use_adapter = bool(use_adapter)
 
     def forward(self, x):
         # Extract backbone features and apply residual adapter if available
         backbone_feats = self.backbone(x)
-        if self.adapter is not None and self.adapter_scale != 0.0:
+        if self.use_adapter and self.adapter is not None and self.adapter_scale != 0.0:
             adapted = backbone_feats + self.adapter_scale * self.adapter(backbone_feats)
             return adapted
         return backbone_feats
 
 
-def load_grl_simclr_model(checkpoint_path, arch="vit_small_patch16_224"):
+def load_grl_simclr_model(
+    checkpoint_path, arch="vit_small_patch16_224", use_adapter: bool = False
+):
     """
     Load GRL-SimCLR model and create embedding extractor.
     """
@@ -91,8 +94,8 @@ def load_grl_simclr_model(checkpoint_path, arch="vit_small_patch16_224"):
         else:
             raise RuntimeError("Checkpoint does not contain required hyperparameters.")
 
-    # Create embedding extractor (backbone + projector only)
-    embedding_net = GRLSimCLREmbeddingNet(model)
+    # Create embedding extractor; by default we ignore adapter to avoid any training dependency
+    embedding_net = GRLSimCLREmbeddingNet(model, use_adapter=use_adapter)
     embedding_net.eval()
 
     print("✅ GRL-SimCLR model loaded successfully")
@@ -354,6 +357,11 @@ def main():
         action="store_true",
         help="Apply L2 normalization to features before post-processing",
     )
+    parser.add_argument(
+        "--use_adapter",
+        action="store_true",
+        help="Use adapter output as embedding if present (default: disabled; use backbone only)",
+    )
 
     args = parser.parse_args()
 
@@ -376,7 +384,7 @@ def main():
     print(f"Using device: {device}")
 
     # Load model
-    model = load_grl_simclr_model(args.ckpt, args.arch)
+    model = load_grl_simclr_model(args.ckpt, args.arch, use_adapter=args.use_adapter)
 
     # Create dataloaders (no transforms needed for inference)
     print("Creating dataloaders...")
