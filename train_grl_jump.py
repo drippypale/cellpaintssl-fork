@@ -229,6 +229,10 @@ class SimCLRWithGRL(SimCLR):
         triplet_weight = kwargs.pop("triplet_weight", 0.0)
         triplet_margin = kwargs.pop("triplet_margin", 0.2)
         triplet_metric = kwargs.pop("triplet_metric", "cosine")
+        # XGBoost masking params for validation reporting
+        xgb_mask_fraction = kwargs.pop("xgb_mask_fraction", 0.0)
+        xgb_top_k_plot = kwargs.pop("xgb_top_k_plot", 40)
+        xgb_random_state = kwargs.pop("xgb_random_state", 42)
 
         super().__init__(**kwargs)
         self.num_domains = int(num_domains)
@@ -252,6 +256,10 @@ class SimCLRWithGRL(SimCLR):
         self.triplet_weight = float(triplet_weight)
         self.triplet_margin = float(triplet_margin)
         self.triplet_metric = str(triplet_metric)
+        # XGB masking params
+        self.xgb_mask_fraction = float(xgb_mask_fraction)
+        self.xgb_top_k_plot = int(xgb_top_k_plot)
+        self.xgb_random_state = int(xgb_random_state)
         # Unfreezing & LLRD
         self.unfreeze_start_epoch = int(unfreeze_start_epoch)
         self.unfreeze_every = int(unfreeze_every)
@@ -289,6 +297,10 @@ class SimCLRWithGRL(SimCLR):
                 self.hparams.triplet_use_memory = self.triplet_use_memory
                 self.hparams.triplet_memory_size = self.triplet_memory_size
                 self.hparams.triplet_semi_hard = self.triplet_semi_hard
+                # XGB masking params
+                self.hparams.xgb_mask_fraction = self.xgb_mask_fraction
+                self.hparams.xgb_top_k_plot = self.xgb_top_k_plot
+                self.hparams.xgb_random_state = self.xgb_random_state
             except Exception:
                 pass
 
@@ -1395,6 +1407,151 @@ class SimCLRWithGRL(SimCLR):
                 except Exception as e:
                     print(f"⚠️  leakage eval failed for {label_key}: {e}")
 
+            # Optional: XGBoost-based masking within mini-eval for reporting
+            try:
+                frac = float(
+                    getattr(
+                        self.hparams,
+                        "xgb_mask_fraction",
+                        getattr(self, "xgb_mask_fraction", 0.0),
+                    )
+                )
+                if frac > 0.0 and len(rows) >= 20:
+                    import numpy as np
+                    import pandas as pd
+
+                    try:
+                        import xgboost as xgb
+                    except Exception as e:
+                        print(f"⚠️  XGBoost unavailable for mini-eval masking: {e}")
+                        raise RuntimeError
+
+                    df_xgb = df.copy()
+                    emb_cols = [c for c in df_xgb.columns if c.startswith("emb")]
+                    if (
+                        len(emb_cols) >= 2
+                        and df_xgb.get("batch").nunique(dropna=True) >= 2
+                    ):
+                        X = df_xgb[emb_cols].to_numpy()
+                        y_raw = df_xgb["batch"].astype(str).fillna("unknown").values
+                        # Encode labels
+                        from sklearn.preprocessing import LabelEncoder
+
+                        le = LabelEncoder()
+                        y = le.fit_transform(y_raw)
+                        clf = xgb.XGBClassifier(
+                            n_estimators=400,
+                            max_depth=5,
+                            learning_rate=0.05,
+                            subsample=0.8,
+                            colsample_bytree=0.8,
+                            objective="multi:softprob",
+                            eval_metric="mlogloss",
+                            random_state=int(
+                                getattr(
+                                    self.hparams,
+                                    "xgb_random_state",
+                                    getattr(self, "xgb_random_state", 42),
+                                )
+                            ),
+                            n_jobs=4,
+                        )
+                        clf.fit(X, y)
+                        booster = clf.get_booster()
+                        try:
+                            score_dict = booster.get_score(importance_type="gain")
+                        except Exception:
+                            score_dict = booster.get_score(importance_type="weight")
+                        importances = np.zeros(len(emb_cols), dtype=float)
+                        for k, v in score_dict.items():
+                            try:
+                                idx = int(k[1:])
+                                if 0 <= idx < len(importances):
+                                    importances[idx] = float(v)
+                            except Exception:
+                                continue
+                        # Mask top fraction
+                        n_drop = int(np.floor(len(emb_cols) * frac))
+                        n_drop = max(0, min(n_drop, len(emb_cols)))
+                        order = np.argsort(-importances)
+                        drop_cols = [emb_cols[i] for i in order[:n_drop]]
+                        keep_cols = [c for c in emb_cols if c not in drop_cols]
+
+                        # Recompute post-mask metrics on df_xgb with kept features only
+                        df_mask = pd.concat(
+                            [
+                                df_xgb[
+                                    [
+                                        c
+                                        for c in df_xgb.columns
+                                        if not c.startswith("emb")
+                                    ]
+                                ],
+                                df_xgb[keep_cols],
+                            ],
+                            axis=1,
+                        )
+
+                        # Target NSP/NSBP post-mask
+                        try:
+                            if (
+                                "target" in df_mask.columns
+                                and df_mask["target"].notnull().any()
+                            ):
+                                feature_cols_m = [
+                                    c for c in df_mask.columns if c.startswith("emb")
+                                ]
+                                X_t = StandardScaler().fit_transform(
+                                    df_mask[feature_cols_m].to_numpy()
+                                )
+                                y_t = LabelEncoder().fit_transform(
+                                    df_mask["target"].astype(str).values
+                                )
+                                wells = (
+                                    df_mask["well"].astype(str).values
+                                    if "well" in df_mask.columns
+                                    else np.array([""] * len(df_mask))
+                                )
+                                batches_t = (
+                                    df_mask["batch"].astype(str).values
+                                    if "batch" in df_mask.columns
+                                    else np.array([""] * len(df_mask))
+                                )
+                                ypred_nsp = evl.nearest_neighbor_classifier_NSBW(
+                                    X_t, y_t, mode="NSW", wells=wells, metric="cosine"
+                                )
+                                self.log(
+                                    "val_target_acc_NSP_postmask",
+                                    float((ypred_nsp == y_t).mean()),
+                                )
+                                ypred_nsbp = evl.nearest_neighbor_classifier_NSBW(
+                                    X_t,
+                                    y_t,
+                                    mode="NSBW",
+                                    batches=batches_t,
+                                    wells=wells,
+                                    metric="cosine",
+                                )
+                                self.log(
+                                    "val_target_acc_NSBP_postmask",
+                                    float((ypred_nsbp == y_t).mean()),
+                                )
+                        except Exception as e:
+                            print(f"⚠️  post-mask target metrics failed: {e}")
+
+                        # Log drop stats
+                        try:
+                            self.log("val_xgb_mask_drop_fraction", float(frac))
+                            self.log("val_xgb_mask_drop_count", float(len(drop_cols)))
+                        except Exception:
+                            pass
+                    else:
+                        print(
+                            "⚠️  XGB mini-eval masking skipped: insufficient emb cols or batches"
+                        )
+            except Exception:
+                pass
+
             # NSB perturbation accuracy
             nsb_acc_val = None
             if (
@@ -1952,6 +2109,25 @@ def main():
         action="store_true",
         help="Disable semi-hard mining (use hardest)",
     )
+    # XGBoost-based feature masking in validation reporting
+    parser.add_argument(
+        "--xgb_mask_fraction",
+        type=float,
+        default=0.0,
+        help="If >0, compute XGBoost batch importances in mini-eval, drop top fraction, and log post-mask metrics.",
+    )
+    parser.add_argument(
+        "--xgb_top_k_plot",
+        type=int,
+        default=40,
+        help="Top-K feature importances to plot during validation mini-eval.",
+    )
+    parser.add_argument(
+        "--xgb_random_state",
+        type=int,
+        default=42,
+        help="Random state for XGBoost in validation mini-eval.",
+    )
 
     args = parser.parse_args()
 
@@ -2170,6 +2346,10 @@ def main():
                 "triplet_use_memory": triplet_use_memory,
                 "triplet_memory_size": triplet_memory_size,
                 "triplet_semi_hard": triplet_semi_hard,
+                # xgb masking params
+                "xgb_mask_fraction": args.xgb_mask_fraction,
+                "xgb_top_k_plot": args.xgb_top_k_plot,
+                "xgb_random_state": args.xgb_random_state,
             }
         )
 
@@ -2254,6 +2434,10 @@ def main():
         triplet_use_memory=triplet_use_memory,
         triplet_memory_size=triplet_memory_size,
         triplet_semi_hard=triplet_semi_hard,
+        # xgb masking params
+        xgb_mask_fraction=args.xgb_mask_fraction,
+        xgb_top_k_plot=args.xgb_top_k_plot,
+        xgb_random_state=args.xgb_random_state,
     )
     print(f"  - Architecture: {args.arch}")
     print(f"  - Hidden dim: {hidden_dim}")
